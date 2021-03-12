@@ -37,7 +37,7 @@ if False:
     from trezor.messages.ButtonRequest import EnumTypeButtonRequestType
 
     ExceptionType = Union[BaseException, Type[BaseException]]
-    PropertyType = Tuple[str, Optional[str]]
+    PropertyType = Tuple[Optional[str], Optional[str]]
 
 
 __all__ = (
@@ -592,7 +592,8 @@ async def confirm_properties(
 ) -> None:
     para = []
     for p in props:
-        para.append((ui.NORMAL, p[0]))
+        if p[0] is not None:
+            para.append((ui.NORMAL, p[0]))
         if p[1] is not None:
             para.append((ui.BOLD, p[1]))
     content = paginate_paragraphs(
