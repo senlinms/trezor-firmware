@@ -1,11 +1,20 @@
-CC = gcc
-CFLAGS = -Wall -Wshadow -Wextra -Wpedantic -Werror -Wno-missing-braces -fPIC
+CC = cc
+
+CFLAGS = -Wall -Wshadow -Wextra -Wpedantic -Werror -Wno-missing-braces
+CFLAGS += -fPIC
+CFALGS += -fsanitize=address,undefined
+CFLAGS += -DTREZOR_MODEL_T
+CFLAGS += -DUSE_INSECURE_PRNG
+
 LIBS =
 INC = -I ../../../crypto -I ../.. -I .
 BASE = ../../../
 
 SRC  = storage/tests/c/flash.c
 SRC += storage/tests/c/common.c
+SRC += storage/tests/c/random_delays.c
+SRC += storage/tests/c/test_layout.c
+SRC += storage/flash_common.c
 SRC += storage/storage.c
 SRC += storage/norcow.c
 SRC += crypto/pbkdf2.c

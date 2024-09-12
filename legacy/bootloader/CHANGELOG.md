@@ -4,7 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## 1.10.0 [unreleased]
+## 1.12.1 [February 2023]
+
+### Fixed
+- Correctly distrust v2-signed firmwares.
+
+
+## 1.12.0 [internal only - January 2023]
+
+### Added
+- T1 bootloader: verify firmware signatures based on SignMessage, add signature debugging  [#2568]
+
+### Fixed
+- Better way to debug T1 combinations of debug/production combinations of bootloader and firmware  [#2423]
+
+
+## 1.11.0 [May 2022]
+
+### Added
+- Bootloader will report version of installed firmware.  [#2231]
+
+### Fixed
+- Compress firmware verification coordinates to be able link bootloader into preallocated space.  [#1884]
+
+### Security
+- Erase storage when downgrading below fix_version.
+- Avoid accidental build with broken stack protector  [#1642]
+
+
+## 1.10.0 [May 2021]
 
 ### Added
 - "Stay in bootloader" flag.  [#1461]
@@ -85,7 +113,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - Clean USB descriptor.
 - Return firmware_present in Features response.
-- Don't halt on broken firware, stay in bootloader.
+- Don't halt on broken firmware, stay in bootloader.
 
 ## 1.2.8 [September 2016]
 
@@ -112,3 +140,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Initial import of code.
 
 [#1461]: https://github.com/trezor/trezor-firmware/pull/1461
+[#1642]: https://github.com/trezor/trezor-firmware/pull/1642
+[#1884]: https://github.com/trezor/trezor-firmware/pull/1884
+[#2231]: https://github.com/trezor/trezor-firmware/pull/2231
+[#2423]: https://github.com/trezor/trezor-firmware/pull/2423
+[#2568]: https://github.com/trezor/trezor-firmware/pull/2568

@@ -6,8 +6,8 @@ if not utils.BITCOIN_ONLY:
     from apps.nem.helpers import *
     from apps.nem.namespace import *
     from apps.nem.namespace.serialize import *
-    from trezor.messages.NEMProvisionNamespace import NEMProvisionNamespace
-    from trezor.messages.NEMSignTx import NEMSignTx
+    from trezor.messages import NEMProvisionNamespace, NEMTransactionCommon
+    from trezor.messages import NEMSignTx
 
 
 @unittest.skipUnless(not utils.BITCOIN_ONLY, "altcoin")
@@ -56,18 +56,24 @@ class TestNemNamespace(unittest.TestCase):
 
 def _create_msg(network: int, timestamp: int, fee: int, deadline: int,
                 name: str, parent: str, sink: str, rental_fee: int):
-    m = NEMSignTx()
-    m.transaction = NEMTransactionCommon()
-    m.transaction.network = network
-    m.transaction.timestamp = timestamp
-    m.transaction.fee = fee
-    m.transaction.deadline = deadline
-    m.provision_namespace = NEMProvisionNamespace()
-    m.provision_namespace.namespace = name
-    m.provision_namespace.parent = parent
-    m.provision_namespace.sink = sink
-    m.provision_namespace.fee = rental_fee
-    return m
+    transaction = NEMTransactionCommon(
+        network=network,
+        timestamp=timestamp,
+        fee=fee,
+        deadline=deadline,
+    )
+
+    provision_namespace = NEMProvisionNamespace(
+        namespace=name,
+        parent=parent,
+        sink=sink,
+        fee=rental_fee,
+    )
+
+    return NEMSignTx(
+        transaction=transaction,
+        provision_namespace=provision_namespace,
+    )
 
 
 if __name__ == '__main__':

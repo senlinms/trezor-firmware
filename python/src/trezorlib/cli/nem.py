@@ -1,6 +1,6 @@
 # This file is part of the Trezor project.
 #
-# Copyright (C) 2012-2019 SatoshiLabs and contributors
+# Copyright (C) 2012-2022 SatoshiLabs and contributors
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3
@@ -15,6 +15,7 @@
 # If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.
 
 import json
+from typing import TYPE_CHECKING, Optional, TextIO
 
 import click
 import requests
@@ -22,11 +23,14 @@ import requests
 from .. import nem, tools
 from . import with_client
 
+if TYPE_CHECKING:
+    from ..client import TrezorClient
+
 PATH_HELP = "BIP-32 path, e.g. m/44'/134'/0'/0'"
 
 
 @click.group(name="nem")
-def cli():
+def cli() -> None:
     """NEM commands."""
 
 
@@ -34,11 +38,18 @@ def cli():
 @click.option("-n", "--address", required=True, help=PATH_HELP)
 @click.option("-N", "--network", type=int, default=0x68)
 @click.option("-d", "--show-display", is_flag=True)
+@click.option("-C", "--chunkify", is_flag=True)
 @with_client
-def get_address(client, address, network, show_display):
+def get_address(
+    client: "TrezorClient",
+    address: str,
+    network: int,
+    show_display: bool,
+    chunkify: bool,
+) -> str:
     """Get NEM address for specified path."""
     address_n = tools.parse_path(address)
-    return nem.get_address(client, address_n, network, show_display)
+    return nem.get_address(client, address_n, network, show_display, chunkify)
 
 
 @cli.command()
@@ -46,20 +57,25 @@ def get_address(client, address, network, show_display):
 @click.option("-n", "--address", required=True, help=PATH_HELP)
 @click.option("-f", "--file", "_ignore", is_flag=True, hidden=True, expose_value=False)
 @click.option("-b", "--broadcast", help="NIS to announce transaction to")
+@click.option("-C", "--chunkify", is_flag=True)
 @with_client
-def sign_tx(client, address, file, broadcast):
+def sign_tx(
+    client: "TrezorClient",
+    address: str,
+    file: TextIO,
+    broadcast: Optional[str],
+    chunkify: bool,
+) -> dict:
     """Sign (and optionally broadcast) NEM transaction.
 
     Transaction file is expected in the NIS (RequestPrepareAnnounce) format.
     """
     address_n = tools.parse_path(address)
-    transaction = nem.sign_tx(client, address_n, json.load(file))
+    transaction = nem.sign_tx(client, address_n, json.load(file), chunkify=chunkify)
 
     payload = {"data": transaction.data.hex(), "signature": transaction.signature.hex()}
 
     if broadcast:
-        return requests.post(
-            "{}/transaction/announce".format(broadcast), json=payload
-        ).json()
+        return requests.post(f"{broadcast}/transaction/announce", json=payload).json()
     else:
         return payload

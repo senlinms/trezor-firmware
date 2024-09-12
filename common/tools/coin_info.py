@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import logging
-import os
 import re
 from collections import OrderedDict, defaultdict
 from pathlib import Path
+from typing import Dict  # for python38 support, must be used in type aliases
+from typing import List  # for python38 support, must be used in type aliases
+from typing import Any, Callable, Iterable, Iterator, cast
+
+from typing_extensions import (  # for python37 support, is not present in typing there
+    Literal,
+    TypedDict,
+)
 
 try:
     import requests
@@ -13,15 +22,135 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-ROOT = (Path(__file__).parent / "..").resolve()
-
-if os.environ.get("DEFS_DIR"):
-    DEFS_DIR = Path(os.environ.get("DEFS_DIR")).resolve()
-else:
-    DEFS_DIR = ROOT / "defs"
+ROOT = Path(__file__).resolve().parent.parent
+DEFS_DIR = ROOT / "defs"
 
 
-def load_json(*path):
+class SupportItemBool(TypedDict):
+    supported: dict[str, bool]
+    unsupported: dict[str, bool]
+
+
+class SupportItemVersion(TypedDict):
+    supported: dict[str, str]
+    unsupported: dict[str, str]
+
+
+class SupportData(TypedDict):
+    connect: SupportItemBool
+    suite: SupportItemBool
+    t1b1: SupportItemVersion
+    t2t1: SupportItemVersion
+    t2b1: SupportItemVersion
+
+
+class SupportInfoItem(TypedDict):
+    connect: bool
+    suite: bool
+    t1b1: Literal[False] | str
+    t2t1: Literal[False] | str
+    t2b1: Literal[False] | str
+
+
+SupportInfo = Dict[str, SupportInfoItem]
+
+WalletItems = Dict[str, str]
+WalletInfo = Dict[str, WalletItems]
+
+
+class Coin(TypedDict):
+    # Necessary fields for BTC - from BTC_CHECKS
+    coin_name: str
+    coin_shortcut: str
+    coin_label: str
+    website: str
+    github: str
+    maintainer: str
+    curve_name: str
+    address_type: int
+    address_type_p2sh: int
+    maxfee_kb: int
+    minfee_kb: int
+    hash_genesis_block: str
+    xprv_magic: int
+    xpub_magic: int
+    xpub_magic_segwit_p2sh: int
+    xpub_magic_segwit_native: int
+    slip44: int
+    segwit: bool
+    decred: bool
+    fork_id: int
+    force_bip143: bool
+    default_fee_b: dict[str, int]
+    dust_limit: int
+    blocktime_seconds: int
+    signed_message_header: str
+    uri_prefix: str
+    min_address_length: int
+    max_address_length: int
+    bech32_prefix: str
+    cashaddr_prefix: str
+
+    # Other fields optionally coming from JSON
+    links: dict[str, str]
+    wallet: WalletItems
+    curve: str
+    decimals: int
+
+    # Mandatory fields added later in coin.update()
+    name: str
+    shortcut: str
+    key: str
+    icon: str
+
+    # Special ETH fields
+    coingecko_id: str
+    chain: str
+    chain_id: int
+    url: str
+
+    # Special erc20 fields
+    symbol: str
+    address: str
+    address_bytes: bytes
+    dup_key_nontoken: bool
+
+    # Special NEM fields
+    ticker: str
+
+    # Fields that are being created
+    unsupported: bool
+    duplicate: bool
+    support: SupportInfoItem
+    is_testnet: bool
+
+    # Backend-oriented fields
+    blockchain_link: dict[str, Any]
+    blockbook: list[str]
+    bitcore: list[str]
+
+
+Coins = List[Coin]
+CoinBuckets = Dict[str, Coins]
+
+
+class FidoApp(TypedDict):
+    name: str
+    webauthn: list[str]
+    u2f: list[dict[str, str]]
+    use_sign_count: bool
+    use_self_attestation: bool
+    use_compact: bool
+    no_icon: bool
+
+    key: str
+    icon: str
+
+
+FidoApps = List[FidoApp]
+
+
+def load_json(*path: str | Path) -> Any:
     """Convenience function to load a JSON file from DEFS_DIR."""
     if len(path) == 1 and isinstance(path[0], Path):
         file = path[0]
@@ -31,10 +160,14 @@ def load_json(*path):
     return json.loads(file.read_text(), object_pairs_hook=OrderedDict)
 
 
+def get_btc_testnet_status(name: str) -> bool:
+    return any((mark in name.lower()) for mark in ("testnet", "regtest"))
+
+
 # ====== CoinsInfo ======
 
 
-class CoinsInfo(dict):
+class CoinsInfo(Dict[str, Coins]):
     """Collection of information about all known kinds of coins.
 
     It contains the following lists:
@@ -47,13 +180,13 @@ class CoinsInfo(dict):
     Accessible as a dict or by attribute: `info["misc"] == info.misc`
     """
 
-    def as_list(self):
+    def as_list(self) -> Coins:
         return sum(self.values(), [])
 
-    def as_dict(self):
+    def as_dict(self) -> dict[str, Coin]:
         return {coin["key"]: coin for coin in self.as_list()}
 
-    def __getattr__(self, attr):
+    def __getattr__(self, attr: str) -> Coins:
         if attr in self:
             return self[attr]
         else:
@@ -63,7 +196,14 @@ class CoinsInfo(dict):
 # ====== coin validation ======
 
 
-def check_type(val, types, nullable=False, empty=False, regex=None, choice=None):
+def check_type(
+    val: Any,
+    types: type | tuple[type, ...],
+    nullable: bool = False,
+    empty: bool = False,
+    regex: str | None = None,
+    choice: list[str] | None = None,
+) -> None:
     # check nullable
     if val is None:
         if nullable:
@@ -73,7 +213,7 @@ def check_type(val, types, nullable=False, empty=False, regex=None, choice=None)
 
     # check type
     if not isinstance(val, types):
-        raise TypeError("Wrong type (expected: {})".format(types))
+        raise TypeError(f"Wrong type (expected: {types})")
 
     # check empty
     if isinstance(val, (list, dict)) and not empty and not val:
@@ -85,26 +225,29 @@ def check_type(val, types, nullable=False, empty=False, regex=None, choice=None)
     if regex is not None:
         if types is not str:
             raise TypeError("Wrong type for regex check")
+        assert isinstance(val, str)
         if not re.search(regex, val):
-            raise ValueError("Value does not match regex {}".format(regex))
+            raise ValueError(f"Value does not match regex {regex}")
 
     # check choice
     if choice is not None and val not in choice:
         choice_str = ", ".join(choice)
-        raise ValueError("Value not allowed, use one of: {}".format(choice_str))
+        raise ValueError(f"Value not allowed, use one of: {choice_str}")
 
 
-def check_key(key, types, optional=False, **kwargs):
-    def do_check(coin):
+def check_key(
+    key: str, types: type | tuple[type, ...], optional: bool = False, **kwargs: Any
+) -> Callable[[Coin], None]:
+    def do_check(coin: Coin) -> None:
         if key not in coin:
             if optional:
                 return
             else:
-                raise KeyError("{}: Missing key".format(key))
+                raise KeyError(f"{key}: Missing key")
         try:
             check_type(coin[key], types, **kwargs)
         except Exception as e:
-            raise ValueError("{}: {}".format(key, e)) from e
+            raise ValueError(f"{key}: {e}") from e
 
     return do_check
 
@@ -112,7 +255,7 @@ def check_key(key, types, optional=False, **kwargs):
 BTC_CHECKS = [
     check_key("coin_name", str, regex=r"^[A-Z]"),
     check_key("coin_shortcut", str, regex=r"^t?[A-Z]{3,}$"),
-    check_key("coin_label", str, regex=r"^[A-Z]"),
+    check_key("coin_label", str, regex=r"^x?[A-Z]"),
     check_key("website", str, regex=r"^https://.*[^/]$"),
     check_key("github", str, regex=r"^https://git(hu|la)b.com/.*[^/]$"),
     check_key("maintainer", str),
@@ -152,15 +295,15 @@ BTC_CHECKS = [
 ]
 
 
-def validate_btc(coin):
-    errors = []
+def validate_btc(coin: Coin) -> list[str]:
+    errors: list[str] = []
     for check in BTC_CHECKS:
         try:
             check(coin)
         except Exception as e:
             errors.append(str(e))
 
-    magics = [
+    magics: list[int] = [
         coin[k]
         for k in (
             "xprv_magic",
@@ -184,6 +327,9 @@ def validate_btc(coin):
     if not coin["max_address_length"] >= coin["min_address_length"]:
         errors.append("max address length must not be smaller than min address length")
 
+    if coin["is_testnet"] and coin["slip44"] != 1:
+        errors.append("testnet coins must use slip44 coin type 1")
+
     if coin["segwit"]:
         if coin["bech32_prefix"] is None:
             errors.append("bech32_prefix must be defined for segwit-enabled coin")
@@ -205,110 +351,90 @@ def validate_btc(coin):
 # ======= Coin json loaders =======
 
 
-def _load_btc_coins():
+def _load_btc_coins() -> Coins:
     """Load btc-like coins from `bitcoin/*.json`"""
-    coins = []
+    coins: Coins = []
     for file in DEFS_DIR.glob("bitcoin/*.json"):
-        coin = load_json(file)
+        coin: Coin = load_json(file)
         coin.update(
             name=coin["coin_label"],
             shortcut=coin["coin_shortcut"],
-            key="bitcoin:{}".format(coin["coin_shortcut"]),
+            key=f"bitcoin:{coin['coin_shortcut']}",
             icon=str(file.with_suffix(".png")),
+            is_testnet=get_btc_testnet_status(coin["coin_label"]),
         )
         coins.append(coin)
 
     return coins
 
 
-def _load_ethereum_networks():
+def _load_builtin_ethereum_networks() -> Coins:
     """Load ethereum networks from `ethereum/networks.json`"""
-    chains_path = DEFS_DIR / "ethereum" / "chains" / "_data" / "chains"
-    networks = []
-    for chain in sorted(
-        chains_path.glob("eip155-*.json"),
-        key=lambda x: int(x.stem.replace("eip155-", "")),
-    ):
-        chain_data = load_json(chain)
-        shortcut = chain_data["nativeCurrency"]["symbol"]
-        name = chain_data["name"]
-        is_testnet = "testnet" in name.lower()
-        if is_testnet:
-            slip44 = 1
-        else:
-            slip44 = chain_data.get("slip44", 60)
-
-        if is_testnet and not shortcut.lower().startswith("t"):
-            shortcut = "t" + shortcut
-
-        rskip60 = shortcut in ("RBTC", "TRBTC")
-
-        # strip out bullcrap in network naming
-        if "mainnet" in name.lower():
-            name = re.sub(r" mainnet.*$", "", name, flags=re.IGNORECASE)
-
-        network = dict(
-            chain=chain_data["shortName"],
-            chain_id=chain_data["chainId"],
-            slip44=slip44,
-            shortcut=shortcut,
-            name=name,
-            rskip60=rskip60,
-            url=chain_data["infoURL"],
-            key=f"eth:{shortcut}",
-        )
-        networks.append(network)
+    chains_data = load_json("ethereum", "networks.json")
+    networks: Coins = []
+    for chain_data in chains_data:
+        chain_data["key"] = f"eth:{chain_data['shortcut']}:{chain_data['chain_id']}"
+        # is_testnet is present in the JSON
+        networks.append(cast(Coin, chain_data))
 
     return networks
 
 
-def _load_erc20_tokens():
-    """Load ERC20 tokens from `ethereum/tokens` submodule."""
-    networks = _load_ethereum_networks()
-    tokens = []
-    for network in networks:
-        chain = network["chain"]
+def _load_builtin_erc20_tokens() -> Coins:
+    """Load ERC20 tokens from `ethereum/tokens.json`."""
+    tokens_data = load_json("ethereum", "tokens.json")
+    all_tokens: Coins = []
 
-        chain_path = DEFS_DIR / "ethereum" / "tokens" / "tokens" / chain
-        for file in sorted(chain_path.glob("*.json")):
-            token = load_json(file)
+    for chain_id_and_chain, tokens in tokens_data.items():
+        chain_id, chain = chain_id_and_chain.split(";", maxsplit=1)
+        for token in tokens:
             token.update(
                 chain=chain,
-                chain_id=network["chain_id"],
+                chain_id=int(chain_id),
+                address=token["address"].lower(),
                 address_bytes=bytes.fromhex(token["address"][2:]),
-                shortcut=token["symbol"],
-                key="erc20:{}:{}".format(chain, token["symbol"]),
+                symbol=token["shortcut"],
+                key=f"erc20:{chain}:{token['shortcut']}",
+                is_testnet=False,
             )
-            tokens.append(token)
+            all_tokens.append(cast(Coin, token))
 
-    return tokens
+    return all_tokens
 
 
-def _load_nem_mosaics():
+def _load_nem_mosaics() -> Coins:
     """Loads NEM mosaics from `nem/nem_mosaics.json`"""
-    mosaics = load_json("nem/nem_mosaics.json")
+    mosaics: Coins = load_json("nem/nem_mosaics.json")
     for mosaic in mosaics:
         shortcut = mosaic["ticker"].strip()
-        mosaic.update(shortcut=shortcut, key="nem:{}".format(shortcut))
+        mosaic.update(
+            shortcut=shortcut,
+            key=f"nem:{shortcut}",
+            is_testnet=False,
+        )
     return mosaics
 
 
-def _load_misc():
+def _load_misc() -> Coins:
     """Loads miscellaneous networks from `misc/misc.json`"""
-    others = load_json("misc/misc.json")
+    others: Coins = load_json("misc/misc.json")
     for other in others:
-        other.update(key="misc:{}".format(other["shortcut"]))
+        other.update(
+            key=f"misc:{other['shortcut']}",
+            is_testnet=False,
+        )
     return others
 
 
-def _load_fido_apps():
+def _load_fido_apps() -> FidoApps:
     """Load FIDO apps from `fido/*.json`"""
-    apps = []
+    apps: FidoApps = []
     for file in sorted(DEFS_DIR.glob("fido/*.json")):
         app_name = file.stem.lower()
         app = load_json(file)
         app.setdefault("use_sign_count", None)
         app.setdefault("use_self_attestation", None)
+        app.setdefault("use_compact", None)
         app.setdefault("u2f", [])
         app.setdefault("webauthn", [])
 
@@ -328,72 +454,62 @@ def _load_fido_apps():
 
 RELEASES_URL = "https://data.trezor.io/firmware/{}/releases.json"
 MISSING_SUPPORT_MEANS_NO = ("connect", "suite")
-VERSIONED_SUPPORT_INFO = ("trezor1", "trezor2")
+VERSIONED_SUPPORT_INFO = ("T1B1", "T2T1", "T2B1")
 
 
-def get_support_data():
+def get_support_data() -> SupportData:
     """Get raw support data from `support.json`."""
     return load_json("support.json")
 
 
-def latest_releases():
-    """Get latest released firmware versions for Trezor 1 and 2"""
+def latest_releases() -> dict[str, Any]:
+    """Get latest released firmware versions for all models"""
     if not requests:
         raise RuntimeError("requests library is required for getting release info")
 
-    latest = {}
-    for v in ("1", "2"):
-        releases = requests.get(RELEASES_URL.format(v)).json()
-        latest["trezor" + v] = max(tuple(r["version"]) for r in releases)
+    latest: dict[str, Any] = {}
+    for model in VERSIONED_SUPPORT_INFO:
+        # TODO: support new UPPERCASE model names in RELEASES_URL
+        url_model = model.lower()  # need to be e.g. t1b1 for now
+        releases = requests.get(RELEASES_URL.format(url_model)).json()
+        latest[model] = max(tuple(r["version"]) for r in releases)
     return latest
 
 
-def is_token(coin):
-    return coin["key"].startswith("erc20:")
-
-
-def support_info_single(support_data, coin):
+def support_info_single(support_data: SupportData, coin: Coin) -> SupportInfoItem:
     """Extract a support dict from `support.json` data.
 
     Returns a dict of support values for each "device", i.e., `support.json`
     top-level key.
 
     The support value for each device is determined in order of priority:
-    * if the coin is a duplicate ERC20 token, all support values are `None`
-    * if the coin has an entry in `unsupported`, its support is `None`
+    * if the coin has an entry in `unsupported`, its support is `False`
     * if the coin has an entry in `supported` its support is that entry
       (usually a version string, or `True` for connect/suite)
-    * otherwise support is presumed "soon"
+    * if the coin doesn't have an entry, its support status is `None`
     """
-    support_info = {}
+    support_info_item = {}
     key = coin["key"]
-    dup = coin.get("duplicate")
     for device, values in support_data.items():
+        assert isinstance(values, dict)
         if key in values["unsupported"]:
-            support_value = False
+            support_value: Any = False
         elif key in values["supported"]:
             support_value = values["supported"][key]
         elif device in MISSING_SUPPORT_MEANS_NO:
             support_value = False
-        elif is_token(coin):
-            if dup:
-                # if duplicate token that is not explicitly listed, it's unsupported
-                support_value = False
-            else:
-                # otherwise implicitly supported in next
-                support_value = "soon"
         else:
             support_value = None
-        support_info[device] = support_value
-    return support_info
+        support_info_item[device] = support_value
+    return cast(SupportInfoItem, support_info_item)
 
 
-def support_info(coins):
+def support_info(coins: Iterable[Coin] | CoinsInfo | dict[str, Coin]) -> SupportInfo:
     """Generate Trezor support information.
 
     Takes a collection of coins and generates a support-info entry for each.
     The support-info is a dict with keys based on `support.json` keys.
-    These are usually: "trezor1", "trezor2", "connect" and "suite".
+    These are usually: "T1B1", "T2T1", "T2B1", "connect" and "suite".
 
     The `coins` argument can be a `CoinsInfo` object, a list or a dict of
     coin items.
@@ -406,29 +522,115 @@ def support_info(coins):
         coins = coins.values()
 
     support_data = get_support_data()
-    support = {}
+    support: SupportInfo = {}
     for coin in coins:
         support[coin["key"]] = support_info_single(support_data, coin)
 
     return support
 
 
+# ====== wallet info ======
+
+WALLET_SUITE = {"Trezor Suite": "https://suite.trezor.io"}
+WALLET_NEM = {"Nano Wallet": "https://nemplatform.com/wallets/#desktop"}
+
+
+def get_wallet_data() -> WalletInfo:
+    """Get wallet data from `wallets.json`."""
+    return load_json("wallets.json")
+
+
+def _suite_support(coin: Coin, support: SupportInfoItem) -> bool:
+    """Check the "suite" support property.
+    If set, check that at least one of the backends run on trezor.io.
+    If yes, assume we support the coin in our wallet.
+    Otherwise it's probably working with a custom backend, which means don't
+    link to our wallet.
+    """
+    if not support["suite"]:
+        return False
+    return any(".trezor.io" in url for url in coin["blockbook"])
+
+
+def wallet_info_single(
+    support_data: SupportInfo,
+    wallet_data: WalletInfo,
+    coin: Coin,
+) -> WalletItems:
+    """Adds together a dict of all wallets for a coin."""
+    wallets: WalletItems = {}
+
+    key = coin["key"]
+
+    # Add wallets from the coin itself
+    # (usually not there, only for the `misc` category)
+    wallets.update(coin.get("wallet", {}))
+
+    # Each coin category has different further logic
+    if key.startswith("bitcoin:"):
+        if _suite_support(coin, support_data[key]):
+            wallets.update(WALLET_SUITE)
+    elif key.startswith("nem:"):
+        wallets.update(WALLET_NEM)
+    elif key.startswith(("eth:", "erc20:", "misc:")):
+        pass  # no special logic here
+    else:
+        raise ValueError(f"Unknown coin category: {key}")
+
+    # Add wallets from `wallets.json`
+    # This must come last as it offers the ability to override existing wallets
+    # (for example with `"Trezor Suite": null` we delete the "Trezor Suite" from the coin)
+    wallets.update(wallet_data.get(key, {}))
+
+    # Removing potentially disabled wallets from the last step
+    wallets = {name: url for name, url in wallets.items() if url}
+
+    return wallets
+
+
+def wallet_info(coins: Iterable[Coin] | CoinsInfo | dict[str, Coin]) -> WalletInfo:
+    """Generate Trezor wallet information.
+
+    Takes a collection of coins and generates a WalletItems entry for each.
+    The WalletItems is a dict with keys being the names of the wallets and
+    values being the URLs to those - same format as in `wallets.json`.
+
+    The `coins` argument can be a `CoinsInfo` object, a list or a dict of
+    coin items.
+
+    Wallet information is taken from `wallets.json`.
+    """
+    if isinstance(coins, CoinsInfo):
+        coins = coins.as_list()
+    elif isinstance(coins, dict):
+        coins = coins.values()
+
+    support_data = support_info(coins)
+    wallet_data = get_wallet_data()
+
+    wallet: WalletInfo = {}
+    for coin in coins:
+        wallet[coin["key"]] = wallet_info_single(support_data, wallet_data, coin)
+
+    return wallet
+
+
 # ====== data cleanup functions ======
 
 
-def _ensure_mandatory_values(coins):
+def _ensure_mandatory_values(coins: Coins) -> None:
     """Checks that every coin has the mandatory fields: name, shortcut, key"""
     for coin in coins:
         if not all(coin.get(k) for k in ("name", "shortcut", "key")):
             raise ValueError(coin)
 
 
-def symbol_from_shortcut(shortcut):
+def symbol_from_shortcut(shortcut: str) -> tuple[str, str]:
     symsplit = shortcut.split(" ", maxsplit=1)
     return symsplit[0], symsplit[1] if len(symsplit) > 1 else ""
 
 
-def mark_duplicate_shortcuts(coins):
+def mark_duplicate_shortcuts(coins: Coins) -> CoinBuckets:
     """Finds coins with identical symbols and sets their `duplicate` field.
 
     "Symbol" here means the first part of `shortcut` (separated by space),
@@ -441,7 +643,7 @@ def mark_duplicate_shortcuts(coins):
     Each coin in every bucket will have its "duplicate" property set to True, unless
     it's explicitly marked as `false` in `duplicity_overrides.json`.
     """
-    dup_symbols = defaultdict(list)
+    dup_symbols: CoinBuckets = defaultdict(list)
 
     for coin in coins:
         symbol, _ = symbol_from_shortcut(coin["shortcut"].lower())
@@ -456,9 +658,9 @@ def mark_duplicate_shortcuts(coins):
     return dup_symbols
 
 
-def apply_duplicity_overrides(coins):
+def apply_duplicity_overrides(coins: Coins) -> Coins:
     overrides = load_json("duplicity_overrides.json")
-    override_bucket = []
+    override_bucket: Coins = []
     for coin in coins:
         override_value = overrides.get(coin["key"])
         if override_value is True:
@@ -469,92 +671,19 @@ def apply_duplicity_overrides(coins):
     return override_bucket
 
 
-def deduplicate_erc20(buckets, networks):
-    """Apply further processing to ERC20 duplicate buckets.
-
-    This function works on results of `mark_duplicate_shortcuts`.
-
-    Buckets that contain at least one non-token are ignored - symbol collisions
-    with non-tokens always apply.
-
-    Otherwise the following rules are applied:
-
-    1. If _all tokens_ in the bucket have shortcuts with distinct suffixes, e.g.,
-    `CAT (BitClave)` and `CAT (Blockcat)`, the bucket is cleared - all are considered
-    non-duplicate.
-
-    (If even one token in the bucket _does not_ have a distinct suffix, e.g.,
-    `MIT` and `MIT (Mychatcoin)`, this rule does not apply and ALL tokens in the bucket
-    are still considered duplicate.)
-
-    2. If there is only one "main" token in the bucket, the bucket is cleared.
-    That means that all other tokens must either be on testnets, or they must be marked
-    as deprecated, with a deprecation pointing to the "main" token.
-    """
-
-    testnet_networks = {n["chain"] for n in networks if "Testnet" in n["name"]}
-
-    def clear_bucket(bucket):
-        # allow all coins, except those that are explicitly marked through overrides
-        for coin in bucket:
-            coin["duplicate"] = False
-
-    for bucket in buckets.values():
-        # Only check buckets that contain purely ERC20 tokens. Collision with
-        # a non-token is always forbidden.
-        if not all(is_token(c) for c in bucket):
-            continue
-
-        splits = (symbol_from_shortcut(coin["shortcut"]) for coin in bucket)
-        suffixes = {suffix for _, suffix in splits}
-        # if 1. all suffixes are distinct and 2. none of them are empty
-        if len(suffixes) == len(bucket) and all(suffixes):
-            clear_bucket(bucket)
-            continue
-
-        # protected categories:
-        testnets = [coin for coin in bucket if coin["chain"] in testnet_networks]
-        deprecated_by_same = [
-            coin
-            for coin in bucket
-            if "deprecation" in coin
-            and any(
-                other["address"] == coin["deprecation"]["new_address"]
-                for other in bucket
-            )
-        ]
-        remaining = [
-            coin
-            for coin in bucket
-            if coin not in testnets and coin not in deprecated_by_same
-        ]
-        if len(remaining) <= 1:
-            for coin in deprecated_by_same:
-                deprecated_symbol = "[deprecated] " + coin["symbol"]
-                coin["shortcut"] = coin["symbol"] = deprecated_symbol
-                coin["key"] += ":deprecated"
-            clear_bucket(bucket)
-
-
-def deduplicate_keys(all_coins):
-    dups = defaultdict(list)
+def find_duplicate_keys(all_coins: Coins) -> None:
+    dups: CoinBuckets = defaultdict(list)
     for coin in all_coins:
         dups[coin["key"]].append(coin)
 
     for coins in dups.values():
         if len(coins) <= 1:
             continue
-        for i, coin in enumerate(coins):
-            if is_token(coin):
-                coin["key"] += ":" + coin["address"][2:6].lower()  # first 4 hex chars
-            elif "chain_id" in coin:
-                coin["key"] += ":" + str(coin["chain_id"])
-            else:
-                coin["key"] += ":{}".format(i)
-                coin["dup_key_nontoken"] = True
+        coin = coins[0]
+        raise ValueError(f"Duplicate key {coin['key']}")
 
 
-def fill_blockchain_links(all_coins):
+def fill_blockchain_links(all_coins: CoinsInfo) -> None:
     blockchain_links = load_json("blockchain_link.json")
     for coins in all_coins.values():
         for coin in coins:
@@ -566,14 +695,14 @@ def fill_blockchain_links(all_coins):
                 coin["blockbook"] = []
 
 
-def _btc_sort_key(coin):
+def _btc_sort_key(coin: Coin) -> str:
     if coin["name"] in ("Bitcoin", "Testnet", "Regtest"):
         return "000000" + coin["name"]
     else:
         return coin["name"]
 
 
-def collect_coin_info():
+def collect_coin_info() -> CoinsInfo:
     """Returns all definition as dict organized by coin type.
     `coins` for btc-like coins,
     `eth` for ethereum networks,
@@ -583,8 +712,8 @@ def collect_coin_info():
     """
     all_coins = CoinsInfo(
         bitcoin=_load_btc_coins(),
-        eth=_load_ethereum_networks(),
-        erc20=_load_erc20_tokens(),
+        eth=_load_builtin_ethereum_networks(),
+        erc20=_load_builtin_erc20_tokens(),
         nem=_load_nem_mosaics(),
         misc=_load_misc(),
     )
@@ -597,7 +726,7 @@ def collect_coin_info():
     return all_coins
 
 
-def sort_coin_infos(all_coins):
+def sort_coin_infos(all_coins: CoinsInfo) -> None:
     for k, coins in all_coins.items():
         if k == "bitcoin":
             coins.sort(key=_btc_sort_key)
@@ -611,7 +740,7 @@ def sort_coin_infos(all_coins):
             coins.sort(key=lambda c: c["key"].upper())
 
 
-def coin_info_with_duplicates():
+def coin_info_with_duplicates() -> tuple[CoinsInfo, CoinBuckets]:
     """Collects coin info, detects duplicates but does not remove them.
 
     Returns the CoinsInfo object and duplicate buckets.
@@ -620,10 +749,8 @@ def coin_info_with_duplicates():
     coin_list = all_coins.as_list()
     # generate duplicity buckets based on shortcuts
     buckets = mark_duplicate_shortcuts(all_coins.as_list())
-    # apply further processing to ERC20 tokens, generate deprecations etc.
-    deduplicate_erc20(buckets, all_coins.eth)
-    # ensure the whole list has unique keys (taking into account changes from deduplicate_erc20)
-    deduplicate_keys(coin_list)
+    # ensure the whole list has unique keys
+    find_duplicate_keys(coin_list)
     # apply duplicity overrides
     buckets["_override"] = apply_duplicity_overrides(coin_list)
     sort_coin_infos(all_coins)
@@ -631,24 +758,21 @@ def coin_info_with_duplicates():
     return all_coins, buckets
 
 
-def coin_info():
+def coin_info() -> CoinsInfo:
     """Collects coin info, fills out support info and returns the result.
 
     Does not auto-delete duplicates. This should now be based on support info.
     """
     all_coins, _ = coin_info_with_duplicates()
-    # all_coins["erc20"] = [
-    #     coin for coin in all_coins["erc20"] if not coin.get("duplicate")
-    # ]
     return all_coins
 
 
-def fido_info():
+def fido_info() -> FidoApps:
     """Returns info about known FIDO/U2F apps."""
     return _load_fido_apps()
 
 
-def search(coins, keyword):
+def search(coins: CoinsInfo | Coins, keyword: str) -> Iterator[Any]:
     kwl = keyword.lower()
     if isinstance(coins, CoinsInfo):
         coins = coins.as_list()

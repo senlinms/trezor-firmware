@@ -43,6 +43,11 @@ typedef struct {
   uint32_t val[BN_LIMBS];
 } bignum256;
 
+// Represents the number sum([val[i] * 2**(29*i) for i in range(18))
+typedef struct {
+  uint32_t val[2 * BN_LIMBS];
+} bignum512;
+
 static inline uint32_t read_be(const uint8_t *data) {
   return (((uint32_t)data[0]) << 24) | (((uint32_t)data[1]) << 16) |
          (((uint32_t)data[2]) << 8) | (((uint32_t)data[3]));
@@ -67,7 +72,9 @@ static inline void write_le(uint8_t *data, uint32_t x) {
   data[0] = x;
 }
 
+void bn_copy_lower(const bignum512 *x, bignum256 *y);
 void bn_read_be(const uint8_t *in_number, bignum256 *out_number);
+void bn_read_be_512(const uint8_t *in_number, bignum512 *out_number);
 void bn_write_be(const bignum256 *in_number, uint8_t *out_number);
 void bn_read_le(const uint8_t *in_number, bignum256 *out_number);
 void bn_write_le(const bignum256 *in_number, uint8_t *out_number);
@@ -94,6 +101,7 @@ void bn_mult_half(bignum256 *x, const bignum256 *prime);
 void bn_mult_k(bignum256 *x, uint8_t k, const bignum256 *prime);
 void bn_mod(bignum256 *x, const bignum256 *prime);
 void bn_multiply(const bignum256 *k, bignum256 *x, const bignum256 *prime);
+void bn_reduce(bignum512 *x, const bignum256 *prime);
 void bn_fast_mod(bignum256 *x, const bignum256 *prime);
 void bn_power_mod(const bignum256 *x, const bignum256 *e,
                   const bignum256 *prime, bignum256 *res);
@@ -108,13 +116,15 @@ void bn_subi(bignum256 *x, uint32_t y, const bignum256 *prime);
 void bn_subtractmod(const bignum256 *x, const bignum256 *y, bignum256 *res,
                     const bignum256 *prime);
 void bn_subtract(const bignum256 *x, const bignum256 *y, bignum256 *res);
+int bn_legendre(const bignum256 *x, const bignum256 *prime);
 void bn_long_division(bignum256 *x, uint32_t d, bignum256 *q, uint32_t *r);
 void bn_divmod58(bignum256 *x, uint32_t *r);
 void bn_divmod1000(bignum256 *x, uint32_t *r);
 void bn_inverse(bignum256 *x, const bignum256 *prime);
 size_t bn_format(const bignum256 *amount, const char *prefix,
                  const char *suffix, unsigned int decimals, int exponent,
-                 bool trailing, char *output, size_t output_length);
+                 bool trailing, char thousands, char *output,
+                 size_t output_length);
 
 // Returns (uint32_t) in_number
 // Assumes in_number < 2**32
@@ -149,13 +159,21 @@ static inline int bn_is_odd(const bignum256 *x) { return (x->val[0] & 1) == 1; }
 
 static inline size_t bn_format_uint64(uint64_t amount, const char *prefix,
                                       const char *suffix, unsigned int decimals,
-                                      int exponent, bool trailing, char *output,
+                                      int exponent, bool trailing,
+                                      char thousands, char *output,
                                       size_t output_length) {
   bignum256 bn_amount;
   bn_read_uint64(amount, &bn_amount);
 
   return bn_format(&bn_amount, prefix, suffix, decimals, exponent, trailing,
-                   output, output_length);
+                   thousands, output, output_length);
+}
+
+static inline size_t bn_format_amount(uint64_t amount, const char *prefix,
+                                      const char *suffix, unsigned int decimals,
+                                      char *output, size_t output_length) {
+  return bn_format_uint64(amount, prefix, suffix, decimals, 0, false, ',',
+                          output, output_length);
 }
 
 #if USE_BN_PRINT

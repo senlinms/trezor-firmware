@@ -25,7 +25,8 @@
         },
         "wallet": {
             "Account Viewer": "https://accountviewer.stellar.org/",
-            "Exodus": "https://www.exodus.io"
+            "Exodus": "https://www.exodus.io",
+            "Stellarport": "https://stellarport.io/"
         }
     },
     {
@@ -79,11 +80,24 @@
         "decimals": 6,
         "links": {
             "Homepage": "https://www.cardano.org",
-            "Github": "https://github.com/input-output-hk/cardano-sl"
+            "Github": "https://github.com/input-output-hk/cardano-node"
         },
         "wallet": {
-            "AdaLite": "https://adalite.io/app",
-            "Yoroi": "https://yoroi-wallet.com"
+            "Trezor Suite": "https://suite.trezor.io"
+        }
+    },
+    {
+        "name": "Cardano Preview Testnet",
+        "shortcut": "tADA",
+        "slip44": 1815,
+        "curve": "ed25519",
+        "decimals": 6,
+        "links": {
+            "Homepage": "https://www.cardano.org",
+            "Github": "https://github.com/input-output-hk/cardano-node"
+        },
+        "wallet": {
+            "Trezor Suite": "https://suite.trezor.io"
         }
     },
     {
@@ -97,33 +111,7 @@
             "Github": "https://github.com/tezos/tezos"
         },
         "wallet": {
-            "SimpleStaking": "https://simplestaking.com"
-        }
-    },
-    {
-        "name": "Ontology",
-        "shortcut": "ONT",
-        "slip44": 1024,
-        "curve": "nist256p1",
-        "decimals": 8,
-        "links": {
-            "Homepage": "https://ont.io",
-            "Github": "https://github.com/ontio/ontology"
-        },
-        "wallet": {}
-    },
-    {
-        "name": "Wanchain",
-        "shortcut": "WAN",
-        "slip44": 5718350,
-        "curve": "secp256k1",
-        "decimals": 18,
-        "links": {
-            "Homepage": "https://wanchain.org",
-            "Github": "https://github.com/wanchain/go-wanchain"
-        },
-        "wallet": {
-            "Wanchain Wallet": "https://www.wanchain.org/getstarted/"
+            "Briskett": "https://briskett.app"
         }
     },
     {

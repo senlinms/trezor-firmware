@@ -39,6 +39,7 @@
 
 #include "extmod/misc.h"
 #include "extmod/vfs_posix.h"
+#include "flash.h"
 #include "genhdr/mpversion.h"
 #include "input.h"
 #include "py/builtin.h"
@@ -134,24 +135,15 @@ STATIC int execute_from_lexer(int source_kind, const void *source,
 
     mp_parse_tree_t parse_tree = mp_parse(lex, input_kind);
 
-#if defined(MICROPY_UNIX_COVERAGE)
-    // allow to print the parse tree in the coverage build
-    if (mp_verbose_flag >= 3) {
-      printf("----------------\n");
-      mp_parse_node_print(parse_tree.root, 0);
-      printf("----------------\n");
-    }
-#endif
-
     mp_obj_t module_fun = mp_compile(&parse_tree, source_name, is_repl);
 
     if (!compile_only) {
       // execute it
       mp_call_function_0(module_fun);
       // check for pending exception
-      if (MP_STATE_VM(mp_pending_exception) != MP_OBJ_NULL) {
-        mp_obj_t obj = MP_STATE_VM(mp_pending_exception);
-        MP_STATE_VM(mp_pending_exception) = MP_OBJ_NULL;
+      if (MP_STATE_MAIN_THREAD(mp_pending_exception) != MP_OBJ_NULL) {
+        mp_obj_t obj = MP_STATE_MAIN_THREAD(mp_pending_exception);
+        MP_STATE_MAIN_THREAD(mp_pending_exception) = MP_OBJ_NULL;
         nlr_raise(obj);
       }
     }
@@ -168,7 +160,7 @@ STATIC int execute_from_lexer(int source_kind, const void *source,
 }
 
 #if MICROPY_USE_READLINE == 1
-#include "lib/mp-readline/readline.h"
+#include "shared/readline/readline.h"
 #else
 STATIC char *strjoin(const char *s1, int sep_char, const char *s2) {
   int l1 = strlen(s1);
@@ -389,7 +381,7 @@ STATIC void pre_process_options(int argc, char **argv) {
             goto invalid_arg;
           }
           if (word_adjust) {
-            heap_size = heap_size * BYTES_PER_WORD / 4;
+            heap_size = heap_size * MP_BYTES_PER_OBJ_WORD / 4;
           }
           // If requested size too small, we'll crash anyway
           if (heap_size < 700) {
@@ -469,23 +461,6 @@ reimport:
   return 0;
 }
 
-MP_NOINLINE int main_(int argc, char **argv);
-
-int main(int argc, char **argv) {
-  collect_hw_entropy();
-
-#if MICROPY_PY_THREAD
-  mp_thread_init();
-#endif
-  // We should capture stack top ASAP after start, and it should be
-  // captured guaranteedly before any other stack variables are allocated.
-  // For this, actual main (renamed main_) should not be inlined into
-  // this function. main_() itself may have other functions inlined (with
-  // their own stack variables), that's why we need this main/main_ split.
-  mp_stack_ctrl_init();
-  return main_(argc, argv);
-}
-
 MP_NOINLINE int main_(int argc, char **argv) {
 #ifdef SIGPIPE
   // Do not raise SIGPIPE, instead return EPIPE. Otherwise, e.g. writing
@@ -501,9 +476,12 @@ MP_NOINLINE int main_(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
 #endif
 
-  mp_stack_set_limit(600000 * (BYTES_PER_WORD / 4));
+  mp_stack_set_limit(600000 * (sizeof(void *) / 4));
 
   pre_process_options(argc, argv);
+
+  // Map trezor.flash to memory.
+  flash_init();
 
 #if MICROPY_ENABLE_GC
   char *heap = malloc(heap_size);
@@ -523,7 +501,7 @@ MP_NOINLINE int main_(int argc, char **argv) {
 #ifdef MICROPY_PY_SYS_PATH_DEFAULT
     path = MICROPY_PY_SYS_PATH_DEFAULT;
 #else
-    path = "~/.micropython/lib:/usr/lib/micropython";
+    path = ".frozen:~/.micropython/lib:/usr/lib/micropython";
 #endif
   }
   size_t path_num = 1;  // [0] is for current dir (or base dir of the script)
@@ -563,14 +541,6 @@ MP_NOINLINE int main_(int argc, char **argv) {
   }
 
   mp_obj_list_init(MP_OBJ_TO_PTR(mp_sys_argv), 0);
-
-#if defined(MICROPY_UNIX_COVERAGE)
-  {
-    MP_DECLARE_CONST_FUN_OBJ_0(extra_coverage_obj);
-    mp_store_global(QSTR_FROM_STR_STATIC("extra_coverage"),
-                    MP_OBJ_FROM_PTR(&extra_coverage_obj));
-  }
-#endif
 
   // Here is some example code to create a class and instance of that class.
   // First is the Python, then the C code.
@@ -646,6 +616,7 @@ MP_NOINLINE int main_(int argc, char **argv) {
                   argv[0], argv[a], errno, strerror(errno));
         // CPython exits with 2 in such case
         ret = 2;
+        free(pathbuf);
         break;
       }
 
@@ -753,3 +724,5 @@ void nlr_jump_fail(void *val) {
   printf("FATAL: uncaught NLR %p\n", val);
   exit(1);
 }
+
+MP_REGISTER_MODULE(MP_QSTR_uos, mp_module_uos);

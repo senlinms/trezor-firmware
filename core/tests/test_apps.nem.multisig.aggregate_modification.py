@@ -2,10 +2,10 @@ from common import *
 from trezor.crypto import hashlib
 
 if not utils.BITCOIN_ONLY:
-    from trezor.messages.NEMAggregateModification import NEMAggregateModification
-    from trezor.messages.NEMCosignatoryModification import NEMCosignatoryModification
-    from trezor.messages.NEMSignTx import NEMSignTx
-    from trezor.messages.NEMTransactionCommon import NEMTransactionCommon
+    from trezor.messages import NEMAggregateModification
+    from trezor.messages import NEMCosignatoryModification
+    from trezor.messages import NEMSignTx
+    from trezor.messages import NEMTransactionCommon
     from apps.nem.helpers import *
     from apps.nem.multisig import *
     from apps.nem.multisig.serialize import *
@@ -156,18 +156,22 @@ def _create_msg(
     modifications: int,
     relative_change: int,
 ):
-    m = NEMSignTx()
-    m.transaction = NEMTransactionCommon()
-    m.transaction.network = network
-    m.transaction.timestamp = timestamp
-    m.transaction.fee = fee
-    m.transaction.deadline = deadline
+    transaction = NEMTransactionCommon(
+        network=network,
+        timestamp=timestamp,
+        fee=fee,
+        deadline=deadline,
+    )
 
-    m.aggregate_modification = NEMAggregateModification()
-    for i in range(modifications):
-        m.aggregate_modification.modifications.append(NEMCosignatoryModification())
-    m.aggregate_modification.relative_change = relative_change
-    return m
+    aggregate_modification = NEMAggregateModification(
+        modifications=[NEMCosignatoryModification(type=5, public_key=b"abc") for _ in range(modifications)],
+        relative_change=relative_change
+    )
+
+    return NEMSignTx(
+        transaction=transaction,
+        aggregate_modification=aggregate_modification,
+    )
 
 
 if __name__ == "__main__":

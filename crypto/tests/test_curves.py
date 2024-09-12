@@ -79,6 +79,8 @@ random_iters = int(os.environ.get("ITERS", 1))
 
 DIR = os.path.abspath(os.path.dirname(__file__))
 lib = c.cdll.LoadLibrary(os.path.join(DIR, "libtrezor-crypto.so"))
+if not lib.zkp_context_is_initialized():
+    assert lib.zkp_context_init() == 0
 
 BIGNUM = c.c_uint32 * 9
 
@@ -139,15 +141,18 @@ def r(request):
     return Random(seed + int(os.environ.get("SEED", 0)))
 
 
-@pytest.fixture(params=list(sorted(curves)))
-def curve(request):
-    name = request.param
+def get_curve_obj(name):
     curve_ptr = lib.get_curve_by_name(bytes(name, "ascii")).contents.params
     assert curve_ptr, "curve {} not found".format(name)
     curve_obj = curves[name]
     curve_obj.ptr = c.cast(curve_ptr, c.POINTER(ecdsa_curve))
     curve_obj.p = curve_obj.curve.p()  # shorthand
     return curve_obj
+
+
+@pytest.fixture(params=list(sorted(curves)))
+def curve(request):
+    return get_curve_obj(request.param)
 
 
 @pytest.fixture(params=points)
@@ -197,7 +202,7 @@ def test_curve_parameters(curve):
 
 def test_point_multiply(curve, r):
     p = r.randpoint(curve)
-    k = r.randrange(0, 2 ** 256)
+    k = r.randrange(0, 2**256)
     kp = k * p
     res = POINT(int2bn(0), int2bn(0))
     lib.point_multiply(curve.ptr, int2bn(k), to_POINT(p), res)
@@ -231,8 +236,8 @@ def test_point_to_jacobian(curve, r):
     jp = JACOBIAN()
     lib.curve_to_jacobian(to_POINT(p), jp, int2bn(curve.p))
     jx, jy, jz = from_JACOBIAN(jp)
-    assert jx % curve.p == (p.x() * jz ** 2) % curve.p
-    assert jy % curve.p == (p.y() * jz ** 3) % curve.p
+    assert jx % curve.p == (p.x() * jz**2) % curve.p
+    assert jy % curve.p == (p.y() * jz**3) % curve.p
 
     q = POINT()
     lib.jacobian_to_curve(jp, q, int2bn(curve.p))
@@ -285,12 +290,35 @@ def sigdecode(sig, _):
     return map(bytes2num, [sig[:32], sig[32:]])
 
 
-def test_sign(curve, r):
+def test_sign_native(curve, r):
     priv = r.randbytes(32)
     digest = r.randbytes(32)
     sig = r.randbytes(64)
 
-    lib.ecdsa_sign_digest(curve.ptr, priv, digest, sig, c.c_void_p(0), c.c_void_p(0))
+    lib.tc_ecdsa_sign_digest(curve.ptr, priv, digest, sig, c.c_void_p(0), c.c_void_p(0))
+
+    exp = bytes2num(priv)
+    sk = ecdsa.SigningKey.from_secret_exponent(exp, curve, hashfunc=hashlib.sha256)
+    vk = sk.get_verifying_key()
+
+    sig_ref = sk.sign_digest_deterministic(
+        digest, hashfunc=hashlib.sha256, sigencode=ecdsa.util.sigencode_string_canonize
+    )
+    assert binascii.hexlify(sig) == binascii.hexlify(sig_ref)
+
+    assert vk.verify_digest(sig, digest, sigdecode)
+
+
+def test_sign_zkp(r):
+    curve = get_curve_obj("secp256k1")
+
+    priv = r.randbytes(32)
+    digest = r.randbytes(32)
+    sig = r.randbytes(64)
+
+    lib.zkp_ecdsa_sign_digest(
+        curve.ptr, priv, digest, sig, c.c_void_p(0), c.c_void_p(0)
+    )
 
     exp = bytes2num(priv)
     sk = ecdsa.SigningKey.from_secret_exponent(exp, curve, hashfunc=hashlib.sha256)

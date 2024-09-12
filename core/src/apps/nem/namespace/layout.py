@@ -1,28 +1,28 @@
-from trezor import ui
-from trezor.messages import NEMProvisionNamespace, NEMTransactionCommon
+from typing import TYPE_CHECKING
 
-from ..layout import require_confirm_content, require_confirm_fee, require_confirm_final
+if TYPE_CHECKING:
+    from trezor.messages import NEMProvisionNamespace, NEMTransactionCommon
 
 
 async def ask_provision_namespace(
-    ctx, common: NEMTransactionCommon, namespace: NEMProvisionNamespace
-):
+    common: NEMTransactionCommon, namespace: NEMProvisionNamespace
+) -> None:
+    from ..layout import (
+        require_confirm_content,
+        require_confirm_fee,
+        require_confirm_final,
+    )
+
     if namespace.parent:
-        content = (
-            ui.NORMAL,
-            "Create namespace",
-            ui.BOLD,
-            namespace.namespace,
-            ui.NORMAL,
-            "under namespace",
-            ui.BOLD,
-            namespace.parent,
-        )
-        await require_confirm_content(ctx, "Confirm namespace", content)
+        content = [
+            ("Create namespace", namespace.namespace),
+            ("under namespace", namespace.parent),
+        ]
+        await require_confirm_content("Confirm namespace", content)
     else:
-        content = (ui.NORMAL, "Create namespace", ui.BOLD, namespace.namespace)
-        await require_confirm_content(ctx, "Confirm namespace", content)
+        content = [("Create namespace", namespace.namespace)]
+        await require_confirm_content("Confirm namespace", content)
 
-    await require_confirm_fee(ctx, "Confirm rental fee", namespace.fee)
+    await require_confirm_fee("Confirm rental fee", namespace.fee)
 
-    await require_confirm_final(ctx, common.fee)
+    await require_confirm_final(common.fee)

@@ -1,6 +1,6 @@
 # This file is part of the Trezor project.
 #
-# Copyright (C) 2012-2019 SatoshiLabs and contributors
+# Copyright (C) 2012-2022 SatoshiLabs and contributors
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3
@@ -15,25 +15,27 @@
 # If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.
 
 import json
+from typing import TYPE_CHECKING, Optional, TextIO
 
 import click
 
 from .. import cardano, messages, tools
 from . import ChoiceType, with_client
 
+if TYPE_CHECKING:
+    from ..client import TrezorClient
+
 PATH_HELP = "BIP-32 path to key, e.g. m/44'/1815'/0'/0/0"
 
-ADDRESS_TYPES = {
-    "byron": messages.CardanoAddressType.BYRON,
-    "base": messages.CardanoAddressType.BASE,
-    "pointer": messages.CardanoAddressType.POINTER,
-    "enterprise": messages.CardanoAddressType.ENTERPRISE,
-    "reward": messages.CardanoAddressType.REWARD,
+TESTNET_CHOICES = {
+    "preprod": "testnet_preprod",
+    "preview": "testnet_preview",
+    "legacy": "testnet_legacy",
 }
 
 
 @click.group(name="cardano")
-def cli():
+def cli() -> None:
     """Cardano commands."""
 
 
@@ -41,17 +43,41 @@ def cli():
 @click.argument("file", type=click.File("r"))
 @click.option("-f", "--file", "_ignore", is_flag=True, hidden=True, expose_value=False)
 @click.option(
+    "-s",
+    "--signing-mode",
+    required=True,
+    type=ChoiceType({m.name: m for m in messages.CardanoTxSigningMode}),
+)
+@click.option(
     "-p", "--protocol-magic", type=int, default=cardano.PROTOCOL_MAGICS["mainnet"]
 )
 @click.option("-N", "--network-id", type=int, default=cardano.NETWORK_IDS["mainnet"])
-@click.option("-t", "--testnet", is_flag=True)
+@click.option("-t", "--testnet", type=ChoiceType(TESTNET_CHOICES))
+@click.option(
+    "-D",
+    "--derivation-type",
+    type=ChoiceType({m.name: m for m in messages.CardanoDerivationType}),
+    default=messages.CardanoDerivationType.ICARUS,
+)
+@click.option("-i", "--include-network-id", is_flag=True)
+@click.option("-C", "chunkify", is_flag=True)
 @with_client
-def sign_tx(client, file, protocol_magic, network_id, testnet):
+def sign_tx(
+    client: "TrezorClient",
+    file: TextIO,
+    signing_mode: messages.CardanoTxSigningMode,
+    protocol_magic: int,
+    network_id: int,
+    testnet: str,
+    derivation_type: messages.CardanoDerivationType,
+    include_network_id: bool,
+    chunkify: bool,
+) -> cardano.SignTxResponse:
     """Sign Cardano transaction."""
     transaction = json.load(file)
 
     if testnet:
-        protocol_magic = cardano.PROTOCOL_MAGICS["testnet"]
+        protocol_magic = cardano.PROTOCOL_MAGICS[testnet]
         network_id = cardano.NETWORK_IDS["testnet"]
 
     inputs = [cardano.parse_input(input) for input in transaction["inputs"]]
@@ -68,9 +94,37 @@ def sign_tx(client, file, protocol_magic, network_id, testnet):
         for withdrawal in transaction.get("withdrawals", ())
     ]
     auxiliary_data = cardano.parse_auxiliary_data(transaction.get("auxiliary_data"))
+    mint = cardano.parse_mint(transaction.get("mint", ()))
+    script_data_hash = cardano.parse_script_data_hash(
+        transaction.get("script_data_hash")
+    )
+    collateral_inputs = [
+        cardano.parse_collateral_input(collateral_input)
+        for collateral_input in transaction.get("collateral_inputs", ())
+    ]
+    required_signers = [
+        cardano.parse_required_signer(required_signer)
+        for required_signer in transaction.get("required_signers", ())
+    ]
+    collateral_return = (
+        cardano.parse_output(transaction["collateral_return"])
+        if transaction.get("collateral_return")
+        else None
+    )
+    total_collateral = transaction.get("total_collateral")
+    reference_inputs = [
+        cardano.parse_reference_input(reference_input)
+        for reference_input in transaction.get("reference_inputs", ())
+    ]
+    additional_witness_requests = [
+        cardano.parse_additional_witness_request(p)
+        for p in transaction["additional_witness_requests"]
+    ]
 
-    signed_transaction = cardano.sign_tx(
+    client.init_device(derive_cardano=True)
+    sign_tx_response = cardano.sign_tx(
         client,
+        signing_mode,
         inputs,
         outputs,
         fee,
@@ -81,43 +135,94 @@ def sign_tx(client, file, protocol_magic, network_id, testnet):
         protocol_magic,
         network_id,
         auxiliary_data,
+        mint,
+        script_data_hash,
+        collateral_inputs,
+        required_signers,
+        collateral_return,
+        total_collateral,
+        reference_inputs,
+        additional_witness_requests,
+        derivation_type=derivation_type,
+        include_network_id=include_network_id,
+        chunkify=chunkify,
     )
 
-    return {
-        "tx_hash": signed_transaction.tx_hash.hex(),
-        "serialized_tx": signed_transaction.serialized_tx.hex(),
-    }
+    sign_tx_response["tx_hash"] = sign_tx_response["tx_hash"].hex()
+    sign_tx_response["witnesses"] = [
+        {
+            "type": witness["type"],
+            "pub_key": witness["pub_key"].hex(),
+            "signature": witness["signature"].hex(),
+            "chain_code": witness["chain_code"].hex()
+            if witness["chain_code"] is not None
+            else None,
+        }
+        for witness in sign_tx_response["witnesses"]
+    ]
+    auxiliary_data_supplement = sign_tx_response.get("auxiliary_data_supplement")
+    if auxiliary_data_supplement:
+        auxiliary_data_supplement["auxiliary_data_hash"] = auxiliary_data_supplement[
+            "auxiliary_data_hash"
+        ].hex()
+        cvote_registration_signature = auxiliary_data_supplement.get(
+            "cvote_registration_signature"
+        )
+        if cvote_registration_signature:
+            auxiliary_data_supplement[
+                "cvote_registration_signature"
+            ] = cvote_registration_signature.hex()
+        sign_tx_response["auxiliary_data_supplement"] = auxiliary_data_supplement
+    return sign_tx_response
 
 
 @cli.command()
-@click.option("-n", "--address", required=True, help=PATH_HELP)
+@click.option("-n", "--address", type=str, default="", help=PATH_HELP)
 @click.option("-d", "--show-display", is_flag=True)
-@click.option("-t", "--address-type", type=ChoiceType(ADDRESS_TYPES), default="base")
-@click.option("-s", "--staking-address", type=str, default=None)
+@click.option(
+    "-t",
+    "--address-type",
+    type=ChoiceType({m.name: m for m in messages.CardanoAddressType}),
+    default="BASE",
+)
+@click.option("-s", "--staking-address", type=str, default="")
 @click.option("-h", "--staking-key-hash", type=str, default=None)
 @click.option("-b", "--block_index", type=int, default=None)
 @click.option("-x", "--tx_index", type=int, default=None)
 @click.option("-c", "--certificate_index", type=int, default=None)
+@click.option("--script-payment-hash", type=str, default=None)
+@click.option("--script-staking-hash", type=str, default=None)
 @click.option(
     "-p", "--protocol-magic", type=int, default=cardano.PROTOCOL_MAGICS["mainnet"]
 )
 @click.option("-N", "--network-id", type=int, default=cardano.NETWORK_IDS["mainnet"])
-@click.option("-e", "--testnet", is_flag=True)
+@click.option("-e", "--testnet", type=ChoiceType(TESTNET_CHOICES))
+@click.option(
+    "-D",
+    "--derivation-type",
+    type=ChoiceType({m.name: m for m in messages.CardanoDerivationType}),
+    default=messages.CardanoDerivationType.ICARUS,
+)
+@click.option("-C", "--chunkify", is_flag=True)
 @with_client
 def get_address(
-    client,
-    address,
-    address_type,
-    staking_address,
-    staking_key_hash,
-    block_index,
-    tx_index,
-    certificate_index,
-    protocol_magic,
-    network_id,
-    show_display,
-    testnet,
-):
+    client: "TrezorClient",
+    address: str,
+    address_type: messages.CardanoAddressType,
+    staking_address: str,
+    staking_key_hash: Optional[str],
+    block_index: Optional[int],
+    tx_index: Optional[int],
+    certificate_index: Optional[int],
+    script_payment_hash: Optional[str],
+    script_staking_hash: Optional[str],
+    protocol_magic: int,
+    network_id: int,
+    show_display: bool,
+    testnet: str,
+    derivation_type: messages.CardanoDerivationType,
+    chunkify: bool,
+) -> str:
     """
     Get Cardano address.
 
@@ -133,12 +238,12 @@ def get_address(
     Byron, enterprise and reward addresses only require the general parameters.
     """
     if testnet:
-        protocol_magic = cardano.PROTOCOL_MAGICS["testnet"]
+        protocol_magic = cardano.PROTOCOL_MAGICS[testnet]
         network_id = cardano.NETWORK_IDS["testnet"]
 
-    staking_key_hash_bytes = None
-    if staking_key_hash:
-        staking_key_hash_bytes = bytes.fromhex(staking_key_hash)
+    staking_key_hash_bytes = cardano.parse_optional_bytes(staking_key_hash)
+    script_payment_hash_bytes = cardano.parse_optional_bytes(script_payment_hash)
+    script_staking_hash_bytes = cardano.parse_optional_bytes(script_staking_hash)
 
     address_parameters = cardano.create_address_parameters(
         address_type,
@@ -148,17 +253,72 @@ def get_address(
         block_index,
         tx_index,
         certificate_index,
+        script_payment_hash_bytes,
+        script_staking_hash_bytes,
     )
 
+    client.init_device(derive_cardano=True)
     return cardano.get_address(
-        client, address_parameters, protocol_magic, network_id, show_display
+        client,
+        address_parameters,
+        protocol_magic,
+        network_id,
+        show_display,
+        derivation_type=derivation_type,
+        chunkify=chunkify,
     )
 
 
 @cli.command()
 @click.option("-n", "--address", required=True, help=PATH_HELP)
+@click.option(
+    "-D",
+    "--derivation-type",
+    type=ChoiceType({m.name: m for m in messages.CardanoDerivationType}),
+    default=messages.CardanoDerivationType.ICARUS,
+)
+@click.option("-d", "--show-display", is_flag=True)
 @with_client
-def get_public_key(client, address):
+def get_public_key(
+    client: "TrezorClient",
+    address: str,
+    derivation_type: messages.CardanoDerivationType,
+    show_display: bool,
+) -> messages.CardanoPublicKey:
     """Get Cardano public key."""
     address_n = tools.parse_path(address)
-    return cardano.get_public_key(client, address_n)
+    client.init_device(derive_cardano=True)
+    return cardano.get_public_key(
+        client, address_n, derivation_type=derivation_type, show_display=show_display
+    )
+
+
+@cli.command()
+@click.argument("file", type=click.File("r"))
+@click.option(
+    "-d",
+    "--display-format",
+    type=ChoiceType({m.name: m for m in messages.CardanoNativeScriptHashDisplayFormat}),
+    default="HIDE",
+)
+@click.option(
+    "-D",
+    "--derivation-type",
+    type=ChoiceType({m.name: m for m in messages.CardanoDerivationType}),
+    default=messages.CardanoDerivationType.ICARUS,
+)
+@with_client
+def get_native_script_hash(
+    client: "TrezorClient",
+    file: TextIO,
+    display_format: messages.CardanoNativeScriptHashDisplayFormat,
+    derivation_type: messages.CardanoDerivationType,
+) -> messages.CardanoNativeScriptHash:
+    """Get Cardano native script hash."""
+    native_script_json = json.load(file)
+    native_script = cardano.parse_native_script(native_script_json)
+
+    client.init_device(derive_cardano=True)
+    return cardano.get_native_script_hash(
+        client, native_script, display_format, derivation_type=derivation_type
+    )

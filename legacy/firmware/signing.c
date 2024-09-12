@@ -18,6 +18,7 @@
  */
 
 #include "signing.h"
+#include "config.h"
 #include "crypto.h"
 #include "ecdsa.h"
 #include "fsm.h"
@@ -29,10 +30,16 @@
 #include "protect.h"
 #include "secp256k1.h"
 #include "transaction.h"
+#include "zkp_bip340.h"
+#if DEBUG_LINK
+#include <inttypes.h>
+#include <stdio.h>
+#endif
 
 static uint32_t change_count;
 static const CoinInfo *coin;
 static AmountUnit amount_unit;
+static bool serialize;
 static CONFIDENTIAL HDNode root;
 static CONFIDENTIAL HDNode node;
 static bool signing = false;
@@ -52,20 +59,27 @@ enum {
 #if !BITCOIN_ONLY
   STAGE_REQUEST_3_PREV_EXTRADATA,
 #endif
+  STAGE_REQUEST_3_ORIG_INPUT,
+  STAGE_REQUEST_3_ORIG_OUTPUT,
+  STAGE_REQUEST_3_ORIG_NONLEGACY_INPUT,
   STAGE_REQUEST_4_INPUT,
   STAGE_REQUEST_4_OUTPUT,
-  STAGE_REQUEST_SEGWIT_INPUT,
+  STAGE_REQUEST_NONLEGACY_INPUT,
   STAGE_REQUEST_5_OUTPUT,
   STAGE_REQUEST_SEGWIT_WITNESS,
 #if !BITCOIN_ONLY
   STAGE_REQUEST_DECRED_WITNESS,
 #endif
 } signing_stage;
+static bool foreign_address_confirmed;  // indicates that user approved warning
+static bool taproot_only;  // indicates whether all internal inputs are Taproot
+static bool has_unverified_external_input;
 static uint32_t idx1;  // The index of the input or output in the current tx
                        // which is being processed, signed or serialized.
 static uint32_t idx2;  // The index of the input or output in the original tx
                        // (Phase 1), in the previous tx (Phase 2) or in the
                        // current tx when computing the legacy digest (Phase 2).
+static uint32_t external_inputs[16];  // bitfield of external input indices
 static uint32_t signatures;
 static TxRequest resp;
 static TxInputType input;
@@ -86,22 +100,34 @@ static uint8_t sig[64];     // Used in Phase 1 to store signature of original tx
 #if !BITCOIN_ONLY
 static uint8_t decred_hash_prefix[32];
 #endif
-static uint8_t hash_inputs_check[32];
-static uint64_t total_in, total_out, change_out;
-static uint64_t orig_total_in, orig_total_out, orig_change_out;
-static uint32_t next_nonsegwit_input;
-static uint32_t progress, progress_step, progress_meta_step;
-static uint32_t tx_weight;
+static uint64_t total_in, external_in, total_out, change_out;
+static uint64_t orig_total_in, orig_external_in, orig_total_out,
+    orig_change_out;
+static uint32_t progress_step, progress_steps, progress_substep,
+    progress_substeps, progress_midpoint, progress_update;
+static const char *progress_label;
+static uint32_t tx_weight, tx_base_weight, our_weight, our_inputs_len;
+PathSchema unlocked_schema;
+
+typedef enum _MatchState {
+  MatchState_UNDEFINED = 0,
+  MatchState_MATCH = 1,
+  MatchState_MISMATCH = 2,
+} MatchState;
 
 typedef struct {
   uint32_t inputs_count;
   uint32_t outputs_count;
+  uint32_t segwit_count;
+  uint32_t next_legacy_input;
   uint32_t min_sequence;
   bool multisig_fp_set;
   bool multisig_fp_mismatch;
   uint8_t multisig_fp[32];
   uint32_t in_address_n[8];
   size_t in_address_n_count;
+  InputScriptType in_script_type;
+  MatchState in_script_type_state;
   uint32_t version;
   uint32_t lock_time;
   uint32_t expiry;
@@ -109,34 +135,42 @@ typedef struct {
   uint32_t timestamp;
 #if !BITCOIN_ONLY
   uint32_t branch_id;
+  uint8_t hash_header[32];
 #endif
+  Hasher hasher_check;
   Hasher hasher_prevouts;
-  Hasher hasher_sequence;
+  Hasher hasher_amounts;
+  Hasher hasher_scriptpubkeys;
+  Hasher hasher_sequences;
   Hasher hasher_outputs;
+  uint8_t hash_inputs_check[32];
   uint8_t hash_prevouts[32];
-  uint8_t hash_sequence[32];
+  uint8_t hash_amounts[32];
+  uint8_t hash_scriptpubkeys[32];
+  uint8_t hash_sequences[32];
   uint8_t hash_outputs[32];
+  uint8_t hash_prevouts143[32];
+  uint8_t hash_outputs143[32];
+  uint8_t hash_sequence143[32];
 } TxInfo;
 
 static TxInfo info;
 
 /* Variables specific to replacement transactions. */
-static bool is_replacement;           // Is this a replacement transaction?
-static bool have_orig_verif_input;    // Is orig_verif_input, sig and node set?
-static TxInputType orig_verif_input;  // The input for signature verification.
+static bool is_replacement;  // Is this a replacement transaction?
 static TxInfo orig_info;
 static uint8_t orig_hash[32];  // TXID of the original transaction.
+
+/* Variables specific to CoinJoin transactions. */
+static secbool is_coinjoin;  // Is this a CoinJoin transaction?
+static uint64_t coinjoin_coordination_fee_base;
+static AuthorizeCoinJoin coinjoin_authorization;
+static CoinJoinRequest coinjoin_request;
+static Hasher coinjoin_request_hasher;
 
 /* A marker for in_address_n_count to indicate a mismatch in bip32 paths in
    input */
 #define BIP32_NOCHANGEALLOWED 1
-/* The number of bip32 levels used in a wallet (chain and address) */
-#define BIP32_WALLET_DEPTH 2
-/* The chain id used for change */
-#define BIP32_CHANGE_CHAIN 1
-/* The maximum allowed change address.  This should be large enough for normal
-   use and still allow to quickly brute-force the correct bip32 path. */
-#define BIP32_MAX_LAST_ELEMENT 1000000
 
 /* transaction header size: 4 byte version */
 #define TXSIZE_HEADER 4
@@ -148,6 +182,10 @@ static uint8_t orig_hash[32];  // TXID of the original transaction.
 /* The maximum number of change-outputs allowed without user confirmation. */
 #define MAX_SILENT_CHANGE_COUNT 2
 
+/* The maximum number of inputs allowed in a transaction is limited by the
+ * number of external inputs that the firmware can count. */
+#define MAX_INPUTS_COUNT (sizeof(external_inputs) * 8)
+
 /* Setting nSequence to this value for every input in a transaction disables
    nLockTime. */
 #define SEQUENCE_FINAL 0xffffffff
@@ -156,10 +194,8 @@ static uint8_t orig_hash[32];  // TXID of the original transaction.
    transaction disables replace-by-fee opt-in. */
 #define MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
 
-enum {
-  SIGHASH_ALL = 1,
-  SIGHASH_FORKID = 0x40,
-};
+/* supported version of Decred script_version */
+#define DECRED_SCRIPT_VERSION 0
 
 enum {
   DECRED_SERIALIZE_FULL = 0,
@@ -187,18 +223,21 @@ Phase1 - process inputs
        - check previous transactions
 =========================================================
 
+Stage 1: Get inputs and optionally get original inputs.
 foreach I (idx1):
     Request I                                                 STAGE_REQUEST_1_INPUT
-    Add I to segwit hash_prevouts, hash_sequence
+    Add I to segwit sub-hashes
     Add I to Decred decred_hash_prefix
     Add I to TransactionChecksum (prevout and type)
     if (I has orig_hash)
         Request input I2 orig_hash, orig_index                STAGE_REQUEST_1_ORIG_INPUT
         Check I matches I2
-        Add I2 to orig_hash_prevouts, orig_hash_sequence
+        Add I2 to original segwit sub-hashes
+        Add I2 to orig_info.hash_inputs_check
     if (Decred)
         Return I
 
+Stage 2: Get outputs and optionally get original outputs.
 foreach O (idx1):
     Request O                                                 STAGE_REQUEST_2_OUTPUT
     Add O to Decred decred_hash_prefix
@@ -216,6 +255,11 @@ foreach O (idx1):
 Check tx fee
 Ask for confirmation
 
+Stage 3: Check transaction.
+
+if (taproot_only)
+    Skip checking of previous transactions.
+
 foreach I (idx1):
     Request I                                                 STAGE_REQUEST_3_INPUT
     Request prevhash I, META                                  STAGE_REQUEST_3_PREV_META
@@ -227,6 +271,34 @@ foreach I (idx1):
     Request prevhash extra data (if applicable)               STAGE_REQUEST_3_PREV_EXTRADATA
     Calculate hash of streamed tx, compare to prevhash I
 
+if (is_replacement)
+    foreach orig I (idx1):
+        if (orig idx1 is not legacy)
+            Request input I, orig_hash, idx1                  STAGE_REQUEST_3_ORIG_NONLEGACY_INPUT
+            Add I to OuterTransactionChecksum
+            Verify signature of I if I is internal
+        else
+            foreach orig I (idx2):
+                Request input I, orig_hash, idx2              STAGE_REQUEST_3_ORIG_INPUT
+                Add I to InnerTransactionChecksum
+                Add I to LegacyTransactionDigest
+                if idx1 == idx2
+                    Add I to OuterTransactionChecksum
+                    Save signature for verification
+
+            Ensure InnerTransactionChecksum matches orig_info.hash_inputs_check
+
+            foreach orig O (idx2):
+                Request output O, orig_hash, idx2             STAGE_REQUEST_3_ORIG_OUTPUT
+                Add O to InnerTransactionChecksum
+                Add O to LegacyTransactionDigest
+
+            Ensure InnerTransactionChecksum matches orig_hash_outputs
+            Verify signature of LegacyTransactionDigest
+
+Ensure OuterTransactionChecksum matches orig_info.hash_inputs_check
+
+
 Phase2: sign inputs, check that nothing changed
 ===============================================
 
@@ -234,8 +306,8 @@ if (Decred)
     Skip to STAGE_REQUEST_DECRED_WITNESS
 
 foreach I (idx1):  // input to sign
-    if (idx1 is segwit)
-        Request I                                             STAGE_REQUEST_SEGWIT_INPUT
+    if (idx1 is not legacy)
+        Request I                                             STAGE_REQUEST_NONLEGACY_INPUT
         Return serialized input chunk
 
     else
@@ -300,6 +372,143 @@ static bool is_rbf_enabled(TxInfo *tx_info) {
   return tx_info->min_sequence <= MAX_BIP125_RBF_SEQUENCE;
 }
 
+static void set_external_input(uint32_t i) {
+  external_inputs[i / 32] |= (1 << (i % 32));
+}
+
+static bool is_external_input(uint32_t i) {
+  return external_inputs[i / 32] & (1 << (i % 32));
+}
+
+static void report_progress(bool force) {
+  static uint32_t update_ctr = 0;
+  if (!force && update_ctr < progress_update) {
+    update_ctr++;
+    return;
+  }
+
+  uint32_t progress = 0;
+  if (progress_midpoint != 0) {
+    if (progress_step < progress_midpoint) {
+      // Checking previous transactions.
+      progress =
+          (500 * progress_step + 500 * progress_substep / progress_substeps) /
+          progress_midpoint;
+    } else {
+      // Signing transaction after checking. No substeps.
+      progress = 500 + 500 * (progress_step - progress_midpoint) /
+                           (progress_steps - progress_midpoint);
+    }
+  } else {
+    // Loading transaction or signing transaction without checking. No substeps.
+    progress = 1000 * progress_step / progress_steps;
+  }
+
+  layoutProgress(progress_label, progress);
+  update_ctr = 0;
+}
+
+#if DEBUG_LINK
+static bool assert_progress_finished(void) {
+  char line[54] = {0};
+  if (progress_step != progress_steps) {
+    snprintf(line, sizeof(line), "%s finished at %" PRIu32 "/%" PRIu32,
+             progress_label, progress_step, progress_steps);
+  } else if (progress_substep != 0) {
+    snprintf(line, sizeof(line), "%s finished at substep %" PRIu32,
+             progress_label, progress_substep);
+  } else {
+    return true;
+  }
+  fsm_sendFailure(FailureType_Failure_FirmwareError, line);
+  signing_abort();
+  return false;
+}
+#endif
+
+static void init_loading_progress(void) {
+  progress_label = _("Loading transaction");
+  progress_step = 0;
+  progress_substep = 0;
+  progress_substeps = 1;  // no substeps in tx loading
+  progress_midpoint = 0;  // no midpoint in tx loading
+  progress_update = 10;   // update screen every 10 steps
+
+  // Stage 1 and 2 - load inputs and outputs
+  progress_steps = info.inputs_count + info.outputs_count;
+
+  report_progress(true);
+}
+
+static void init_signing_progress(void) {
+  progress_label = _("Signing transaction");
+  progress_step = 0;
+  progress_steps = 0;
+  progress_update = 20;  // update screen every 20 steps
+
+  // Verify previous transactions (STAGE_REQUEST_3_PREV_*).
+  // We don't know how long it will take to fetch the previous transactions. If
+  // they need to be checked, then we will reserve 50 % of the progress for
+  // this. Once we fetch a prev_tx's metadata, we subdivide the reserved space
+  // into substeps which represent the progress of fetching one prev_tx input or
+  // output.
+  if (!taproot_only && !(coin->overwintered && info.version == 5)) {
+    progress_steps += info.inputs_count;
+    progress_midpoint = progress_steps;
+  }
+
+  uint32_t external_count = 0;
+  for (size_t i = 0; i < info.inputs_count; ++i) {
+    external_count += is_external_input(i);
+  }
+
+  // Process inputs.
+  if (!(coin->force_bip143 || coin->overwintered || coin->decred)) {
+    // Sign and optionally serialize legacy inputs (STAGE_REQUEST_4_*).
+    progress_steps += (info.inputs_count - info.segwit_count - external_count) *
+                      (info.inputs_count + info.outputs_count);
+
+    if (serialize) {
+      // Serialize non-legacy inputs (STAGE_REQUEST_NONLEGACY_INPUT).
+      progress_steps += info.segwit_count + external_count;
+    }
+
+    if (is_replacement) {
+      // Verify original input signatures (STAGE_REQUEST_3_ORIG_*).
+      progress_steps +=
+          (orig_info.inputs_count - orig_info.segwit_count - external_count) *
+          (orig_info.inputs_count + orig_info.outputs_count);
+      progress_steps += orig_info.segwit_count;
+    }
+  } else {
+    // Sign and optionally serialize each input (STAGE_REQUEST_NONLEGACY_INPUT,
+    // or in case of Decred STAGE_REQUEST_DECRED_WITNESS).
+    progress_steps += info.inputs_count;
+    if (is_replacement) {
+      // Verify each original input (STAGE_REQUEST_3_ORIG_NONLEGACY_INPUT).
+      progress_steps += orig_info.inputs_count;
+    }
+  }
+
+  if (to.is_segwit) {
+    if (serialize) {
+      // Serialize witnesses for all inputs (STAGE_REQUEST_SEGWIT_WITNESS).
+      progress_steps += info.inputs_count;
+    } else {
+      // Process witnesses for all internal inputs
+      // (STAGE_REQUEST_SEGWIT_WITNESS).
+      progress_steps += info.inputs_count - external_count;
+    }
+  }
+
+  // Serialize outputs (STAGE_REQUEST_5_OUTPUT).
+  if (serialize && !coin->decred) {
+    progress_steps += info.outputs_count;
+  }
+
+  report_progress(true);
+}
+
 void send_req_1_input(void) {
   signing_stage = STAGE_REQUEST_1_INPUT;
   resp.has_request_type = true;
@@ -316,9 +525,8 @@ void send_req_1_orig_meta(void) {
   resp.request_type = RequestType_TXMETA;
   resp.has_details = true;
   resp.details.has_tx_hash = true;
-  resp.details.tx_hash.size = input.orig_hash.size;
-  memcpy(resp.details.tx_hash.bytes, input.orig_hash.bytes,
-         resp.details.tx_hash.size);
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
@@ -330,9 +538,8 @@ void send_req_1_orig_input(void) {
   resp.details.has_request_index = true;
   resp.details.request_index = idx2;
   resp.details.has_tx_hash = true;
-  resp.details.tx_hash.size = input.orig_hash.size;
-  memcpy(resp.details.tx_hash.bytes, input.orig_hash.bytes,
-         resp.details.tx_hash.size);
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
@@ -354,9 +561,8 @@ void send_req_2_orig_output(void) {
   resp.details.has_request_index = true;
   resp.details.request_index = idx2;
   resp.details.has_tx_hash = true;
-  resp.details.tx_hash.size = output.orig_hash.size;
-  memcpy(resp.details.tx_hash.bytes, output.orig_hash.bytes,
-         resp.details.tx_hash.size);
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
@@ -445,6 +651,45 @@ void send_req_3_prev_extradata(uint32_t chunk_offset, uint32_t chunk_len) {
 }
 #endif
 
+void send_req_3_orig_nonlegacy_input(void) {
+  signing_stage = STAGE_REQUEST_3_ORIG_NONLEGACY_INPUT;
+  resp.has_request_type = true;
+  resp.request_type = RequestType_TXORIGINPUT;
+  resp.has_details = true;
+  resp.details.has_request_index = true;
+  resp.details.request_index = idx1;
+  resp.details.has_tx_hash = true;
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
+  msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
+void send_req_3_orig_input(void) {
+  signing_stage = STAGE_REQUEST_3_ORIG_INPUT;
+  resp.has_request_type = true;
+  resp.request_type = RequestType_TXORIGINPUT;
+  resp.has_details = true;
+  resp.details.has_request_index = true;
+  resp.details.request_index = idx2;
+  resp.details.has_tx_hash = true;
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
+  msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
+void send_req_3_orig_output(void) {
+  signing_stage = STAGE_REQUEST_3_ORIG_OUTPUT;
+  resp.has_request_type = true;
+  resp.request_type = RequestType_TXORIGOUTPUT;
+  resp.has_details = true;
+  resp.details.has_request_index = true;
+  resp.details.request_index = idx2;
+  resp.details.has_tx_hash = true;
+  resp.details.tx_hash.size = sizeof(orig_hash);
+  memcpy(resp.details.tx_hash.bytes, orig_hash, resp.details.tx_hash.size);
+  msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
 void send_req_4_input(void) {
   signing_stage = STAGE_REQUEST_4_INPUT;
   resp.has_request_type = true;
@@ -465,8 +710,8 @@ void send_req_4_output(void) {
   msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
-void send_req_segwit_input(void) {
-  signing_stage = STAGE_REQUEST_SEGWIT_INPUT;
+void send_req_nonlegacy_input(void) {
+  signing_stage = STAGE_REQUEST_NONLEGACY_INPUT;
   resp.has_request_type = true;
   resp.request_type = RequestType_TXINPUT;
   resp.has_details = true;
@@ -510,6 +755,11 @@ void send_req_5_output(void) {
 }
 
 void send_req_finished(void) {
+#if DEBUG_LINK
+  if (!assert_progress_finished()) {
+    return;
+  }
+#endif
   resp.has_request_type = true;
   resp.request_type = RequestType_TXFINISHED;
   msg_write(MessageType_MessageType_TxRequest, &resp);
@@ -520,7 +770,6 @@ void phase1_request_next_input(void) {
     idx1++;
     send_req_1_input();
   } else {
-    hasher_Final(&hasher_check, hash_inputs_check);
     idx1 = 0;
 
     if (is_replacement) {
@@ -547,6 +796,12 @@ void phase1_request_next_input(void) {
       }
 
       idx2 = 0;
+    }
+
+    if (to.is_segwit) {
+      tx_base_weight += TXSIZE_SEGWIT_OVERHEAD;
+      tx_weight += TXSIZE_SEGWIT_OVERHEAD + to.inputs_len;
+      our_weight += TXSIZE_SEGWIT_OVERHEAD + our_inputs_len;
     }
 
     send_req_2_output();
@@ -587,13 +842,190 @@ void phase1_request_orig_input(void) {
   }
 }
 
-void phase2_request_next_input(void) {
-  if (idx1 == next_nonsegwit_input) {
-    idx2 = 0;
-    send_req_4_input();
+void phase2_request_next_witness(bool first) {
+  if (first) {
+    idx1 = 0;
+    if (!to.is_segwit) {
+      send_req_finished();
+      signing_abort();
+      return;
+    }
+  } else if (idx1 < info.inputs_count - 1) {
+    idx1++;
   } else {
-    send_req_segwit_input();
+    send_req_finished();
+    signing_abort();
+    return;
   }
+
+  if (!serialize) {
+    // Skip external inputs when serialization is disabled.
+    while (is_external_input(idx1)) {
+      if (idx1 >= info.inputs_count - 1) {
+        send_req_finished();
+        signing_abort();
+        return;
+      }
+      idx1++;
+    }
+  }
+
+  send_req_segwit_witness();
+  return;
+}
+
+void phase2_request_next_output(bool first) {
+  if (first) {
+    if (serialize) {
+      idx1 = 0;
+      send_req_5_output();
+      return;
+    }
+  } else if (idx1 < info.outputs_count - 1) {
+    idx1++;
+    send_req_5_output();
+    return;
+  }
+
+  // Output serialization is finished. Generate witnesses.
+  phase2_request_next_witness(true);
+}
+
+void phase2_request_next_input(bool first) {
+  if (first) {
+    idx1 = 0;
+  } else if (idx1 < info.inputs_count - 1) {
+    idx1++;
+  } else {
+    // Input processing is finished. Serialize outputs.
+    phase2_request_next_output(true);
+    return;
+  }
+
+  if (serialize || coin->force_bip143 || coin->overwintered) {
+    // We are processing all inputs.
+    if (idx1 == info.next_legacy_input) {
+      idx2 = 0;
+      send_req_4_input();
+    } else {
+      send_req_nonlegacy_input();
+    }
+  } else {
+    // We are only signing legacy inputs.
+    if (info.next_legacy_input == 0xffffffff || idx1 > info.next_legacy_input) {
+      // There are no legacy inputs or no more legacy inputs, so serialize
+      // outputs.
+      phase2_request_next_output(true);
+    } else {
+      // Sign next legacy input.
+      idx1 = info.next_legacy_input;
+      idx2 = 0;
+      send_req_4_input();
+    }
+  }
+}
+
+void phase2_request_orig_input(void) {
+  if (idx1 < orig_info.inputs_count) {
+    if (idx1 == 0) {
+      // Reset outer transaction check.
+      hasher_Reset(&hasher_check);
+    }
+
+    if (idx1 == orig_info.next_legacy_input) {
+      idx2 = 0;
+      send_req_3_orig_input();
+    } else {
+      send_req_3_orig_nonlegacy_input();
+    }
+  } else {
+    // Ensure that the original transaction inputs haven't changed for the outer
+    // transaction check.
+    uint8_t hash[32];
+    hasher_Final(&hasher_check, hash);
+    if (memcmp(hash, orig_info.hash_inputs_check, 32) != 0) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Transaction has changed during signing"));
+      signing_abort();
+      return;
+    }
+
+    phase2_request_next_input(true);
+  }
+}
+
+static bool extract_input_multisig_fp(TxInfo *tx_info,
+                                      const TxInputType *txinput) {
+  if (txinput->has_multisig && !tx_info->multisig_fp_mismatch) {
+    uint8_t h[32] = {0};
+    if (cryptoMultisigFingerprint(&txinput->multisig, h) == 0) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Error computing multisig fingerprint"));
+      signing_abort();
+      return false;
+    }
+    if (tx_info->multisig_fp_set) {
+      if (memcmp(tx_info->multisig_fp, h, 32) != 0) {
+        tx_info->multisig_fp_mismatch = true;
+      }
+    } else {
+      memcpy(tx_info->multisig_fp, h, 32);
+      tx_info->multisig_fp_set = true;
+    }
+  } else {  // single signature
+    tx_info->multisig_fp_mismatch = true;
+  }
+
+  return true;
+}
+
+bool check_change_multisig_fp(const TxInfo *tx_info,
+                              const TxOutputType *txoutput) {
+  uint8_t h[32] = {0};
+  return tx_info->multisig_fp_set && !tx_info->multisig_fp_mismatch &&
+         cryptoMultisigFingerprint(&(txoutput->multisig), h) &&
+         memcmp(tx_info->multisig_fp, h, 32) == 0;
+}
+
+static InputScriptType simple_script_type(InputScriptType script_type) {
+  // SPENDMULTISIG is used only for non-SegWit and is effectively the same as
+  // SPENDADDRESS. For SegWit inputs and outputs multisig is indicated by the
+  // presence of the multisig structure. for both SegWit and non-SegWit we can
+  // rely on multisig_fp to check the multisig structure.
+  if (script_type == InputScriptType_SPENDMULTISIG) {
+    script_type = InputScriptType_SPENDADDRESS;
+  }
+
+  return script_type;
+}
+
+void extract_input_script_type(TxInfo *tx_info, const TxInputType *tinput) {
+  switch (tx_info->in_script_type_state) {
+    case MatchState_UNDEFINED:
+      // initialize in_script_type on first input seen
+      tx_info->in_script_type = simple_script_type(tinput->script_type);
+      tx_info->in_script_type_state = MatchState_MATCH;
+      break;
+    case MatchState_MATCH:
+      // check that all input script types are the same
+      if (tx_info->in_script_type != simple_script_type(tinput->script_type)) {
+        tx_info->in_script_type_state = MatchState_MISMATCH;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+bool check_change_script_type(const TxInfo *tx_info,
+                              const TxOutputType *toutput) {
+  InputScriptType input_script_type = 0;
+  if (!change_output_to_input_script_type(toutput->script_type,
+                                          &input_script_type)) {
+    return false;
+  }
+  return tx_info->in_script_type_state == MatchState_MATCH &&
+         tx_info->in_script_type == simple_script_type(input_script_type);
 }
 
 void extract_input_bip32_path(TxInfo *tx_info, const TxInputType *tinput) {
@@ -640,18 +1072,18 @@ bool check_change_bip32_path(const TxInfo *tx_info,
   return (count >= BIP32_WALLET_DEPTH && count == tx_info->in_address_n_count &&
           0 == memcmp(tx_info->in_address_n, toutput->address_n,
                       (count - BIP32_WALLET_DEPTH) * sizeof(uint32_t)) &&
-          toutput->address_n[count - 2] <= BIP32_CHANGE_CHAIN &&
-          toutput->address_n[count - 1] <= BIP32_MAX_LAST_ELEMENT);
+          toutput->address_n[count - 2] <= PATH_MAX_CHANGE &&
+          toutput->address_n[count - 1] <= PATH_MAX_ADDRESS_INDEX);
 }
 
 static bool fill_input_script_sig(TxInputType *tinput) {
-  memcpy(&node, &root, sizeof(HDNode));
-  if (hdnode_private_ckd_cached(&node, tinput->address_n,
-                                tinput->address_n_count, NULL) == 0) {
-    // Failed to derive private key
+  if (hdnode_fill_public_key(&node) != 0) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to derive public key."));
+    signing_abort();
     return false;
   }
-  hdnode_fill_public_key(&node);
+
   if (tinput->has_multisig) {
     tinput->script_sig.size = compile_script_multisig(coin, &(tinput->multisig),
                                                       tinput->script_sig.bytes);
@@ -661,34 +1093,108 @@ static bool fill_input_script_sig(TxInputType *tinput) {
     tinput->script_sig.size =
         compile_script_sig(coin->address_type, hash, tinput->script_sig.bytes);
   }
-  return tinput->script_sig.size > 0;
-}
 
-bool compile_input_script_sig(TxInputType *tinput) {
-  if (!info.multisig_fp_mismatch) {
-    // check that this is still multisig
-    uint8_t h[32] = {0};
-    if (!tinput->has_multisig ||
-        cryptoMultisigFingerprint(&(tinput->multisig), h) == 0 ||
-        memcmp(info.multisig_fp, h, 32) != 0) {
-      // Transaction has changed during signing
-      return false;
-    }
-  }
-  if (info.in_address_n_count != BIP32_NOCHANGEALLOWED) {
-    // check that input address didn't change
-    size_t count = tinput->address_n_count;
-    if (count < 2 || count != info.in_address_n_count ||
-        0 != memcmp(info.in_address_n, tinput->address_n,
-                    (count - 2) * sizeof(uint32_t))) {
-      return false;
-    }
-  }
-  if (!coin_known_path_check(coin, tinput->script_type, tinput->address_n_count,
-                             tinput->address_n, false)) {
+  if (tinput->script_sig.size == 0) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to compile input."));
+    signing_abort();
     return false;
   }
-  return fill_input_script_sig(tinput);
+
+  return true;
+}
+
+static bool fill_input_script_pubkey(TxInputType *in) {
+  if (!get_script_pubkey(coin, &node, in->has_multisig, &in->multisig,
+                         in->script_type, in->script_pubkey.bytes,
+                         &in->script_pubkey.size)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to derive scriptPubKey"));
+    signing_abort();
+    return false;
+  }
+  in->has_script_pubkey = true;
+  return true;
+}
+
+static bool validate_path(InputScriptType script_type,
+                          pb_size_t address_n_count, const uint32_t *address_n,
+                          bool has_multisig) {
+  if (is_coinjoin == sectrue) {
+    // Check whether the authorization matches the parameters of the input.
+    if (address_n_count !=
+            coinjoin_authorization.address_n_count + BIP32_WALLET_DEPTH ||
+        memcmp(address_n, coinjoin_authorization.address_n,
+               sizeof(uint32_t) * coinjoin_authorization.address_n_count) !=
+            0 ||
+        script_type != coinjoin_authorization.script_type) {
+      fsm_sendFailure(FailureType_Failure_ProcessError, _("Unauthorized path"));
+      signing_abort();
+      return false;
+    }
+  } else {
+    // Sanity check not critical for security. The main reason for this is that
+    // we are not comfortable with using the same private key in multiple
+    // signature schemes (ECDSA and Schnorr) and we want to be sure that the
+    // user went through a warning screen before we sign the input.
+    if (!coin_path_check(coin, script_type, address_n_count, address_n,
+                         has_multisig, unlocked_schema, true)) {
+      if (config_getSafetyCheckLevel() == SafetyCheckLevel_Strict &&
+          !coin_path_check(coin, script_type, address_n_count, address_n,
+                           has_multisig, unlocked_schema, false)) {
+        fsm_sendFailure(FailureType_Failure_DataError, _("Forbidden key path"));
+        signing_abort();
+        return false;
+      }
+
+      if (!foreign_address_confirmed) {
+        if (signing_stage < STAGE_REQUEST_3_INPUT) {
+          if (!fsm_layoutPathWarning()) {
+            signing_abort();
+            return false;
+          }
+          foreign_address_confirmed = true;
+        } else {
+          fsm_sendFailure(FailureType_Failure_ProcessError,
+                          _("Transaction has changed during signing"));
+          signing_abort();
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+static bool input_validate_path(const TxInputType *txi) {
+  return validate_path(txi->script_type, txi->address_n_count, txi->address_n,
+                       txi->has_multisig);
+}
+
+static bool derive_node(InputScriptType script_type, pb_size_t address_n_count,
+                        const uint32_t *address_n, bool has_multisig) {
+  if (!coin_path_check(coin, script_type, address_n_count, address_n,
+                       has_multisig, unlocked_schema, false) &&
+      config_getSafetyCheckLevel() == SafetyCheckLevel_Strict) {
+    fsm_sendFailure(FailureType_Failure_DataError, _("Forbidden key path"));
+    signing_abort();
+    return false;
+  }
+
+  memcpy(&node, &root, sizeof(HDNode));
+  if (hdnode_private_ckd_cached(&node, address_n, address_n_count, NULL) == 0) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to derive private key."));
+    signing_abort();
+    return false;
+  }
+
+  return true;
+}
+
+static bool input_derive_node(const TxInputType *txi) {
+  return derive_node(txi->script_type, txi->address_n_count, txi->address_n,
+                     txi->has_multisig);
 }
 
 static bool tx_info_init(TxInfo *tx_info, uint32_t inputs_count,
@@ -735,10 +1241,14 @@ static bool tx_info_init(TxInfo *tx_info, uint32_t inputs_count,
 
   tx_info->inputs_count = inputs_count;
   tx_info->outputs_count = outputs_count;
+  tx_info->segwit_count = 0;
+  tx_info->next_legacy_input = 0xffffffff;
   tx_info->min_sequence = SEQUENCE_FINAL;
   tx_info->multisig_fp_set = false;
   tx_info->multisig_fp_mismatch = false;
   tx_info->in_address_n_count = 0;
+  tx_info->in_script_type = 0;
+  tx_info->in_script_type_state = MatchState_UNDEFINED;
   tx_info->version = version;
   tx_info->lock_time = lock_time;
 
@@ -780,7 +1290,7 @@ static bool tx_info_init(TxInfo *tx_info, uint32_t inputs_count,
       return false;
     }
 
-    if (tx_info->version != 4) {
+    if (tx_info->version != 4 && tx_info->version != 5) {
       fsm_sendFailure(FailureType_Failure_DataError,
                       _("Unsupported transaction version."));
       signing_abort();
@@ -795,32 +1305,96 @@ static bool tx_info_init(TxInfo *tx_info, uint32_t inputs_count,
   }
 #endif
 
+  hasher_Init(&tx_info->hasher_check, HASHER_SHA2);
+
 #if !BITCOIN_ONLY
   if (coin->overwintered) {
-    // ZIP-243
-    hasher_InitParam(&tx_info->hasher_prevouts, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashPrevoutHash", 16);
-    hasher_InitParam(&tx_info->hasher_sequence, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashSequencHash", 16);
-    hasher_InitParam(&tx_info->hasher_outputs, HASHER_BLAKE2B_PERSONAL,
-                     "ZcashOutputsHash", 16);
+    if (tx_info->version == 5) {
+      // ZIP-244
+      hasher_InitParam(&tx_info->hasher_prevouts, HASHER_BLAKE2B_PERSONAL,
+                       "ZTxIdPrevoutHash", 16);
+      hasher_InitParam(&tx_info->hasher_amounts, HASHER_BLAKE2B_PERSONAL,
+                       "ZTxTrAmountsHash", 16);
+      hasher_InitParam(&tx_info->hasher_scriptpubkeys, HASHER_BLAKE2B_PERSONAL,
+                       "ZTxTrScriptsHash", 16);
+      hasher_InitParam(&tx_info->hasher_sequences, HASHER_BLAKE2B_PERSONAL,
+                       "ZTxIdSequencHash", 16);
+      hasher_InitParam(&tx_info->hasher_outputs, HASHER_BLAKE2B_PERSONAL,
+                       "ZTxIdOutputsHash", 16);
+    } else {
+      // ZIP-243
+      hasher_InitParam(&tx_info->hasher_prevouts, HASHER_BLAKE2B_PERSONAL,
+                       "ZcashPrevoutHash", 16);
+      hasher_InitParam(&tx_info->hasher_sequences, HASHER_BLAKE2B_PERSONAL,
+                       "ZcashSequencHash", 16);
+      hasher_InitParam(&tx_info->hasher_outputs, HASHER_BLAKE2B_PERSONAL,
+                       "ZcashOutputsHash", 16);
+    }
   } else
 #endif
   {
-    // BIP-143
-    hasher_Init(&tx_info->hasher_prevouts, coin->curve->hasher_sign);
-    hasher_Init(&tx_info->hasher_sequence, coin->curve->hasher_sign);
-    hasher_Init(&tx_info->hasher_outputs, coin->curve->hasher_sign);
+    // BIP-143/BIP-341
+    hasher_Init(&tx_info->hasher_prevouts, HASHER_SHA2);
+    hasher_Init(&tx_info->hasher_amounts, HASHER_SHA2);
+    hasher_Init(&tx_info->hasher_scriptpubkeys, HASHER_SHA2);
+    hasher_Init(&tx_info->hasher_sequences, HASHER_SHA2);
+    hasher_Init(&tx_info->hasher_outputs, HASHER_SHA2);
   }
 
   return true;
 }
 
-void signing_init(const SignTx *msg, const CoinInfo *_coin,
-                  const HDNode *_root) {
+static bool init_coinjoin(const SignTx *msg,
+                          const AuthorizeCoinJoin *authorization) {
+  if (!msg->has_coinjoin_request) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Missing coinjoin request."));
+    signing_abort();
+    return false;
+  }
+
+  if (strcmp(coin->coin_name, authorization->coin_name) != 0) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Unauthorized operation."));
+  }
+
+  memcpy(&coinjoin_authorization, authorization,
+         sizeof(coinjoin_authorization));
+  memcpy(&coinjoin_request, &msg->coinjoin_request, sizeof(coinjoin_request));
+
+  // Begin hashing the CoinJoin request.
+  hasher_Init(&coinjoin_request_hasher, HASHER_SHA2);
+  hasher_Update(&coinjoin_request_hasher, (const uint8_t *)"CJR1", 4);
+  size_t coordinator_len =
+      strnlen(authorization->coordinator, sizeof(authorization->coordinator));
+  tx_script_hash(&coinjoin_request_hasher, coordinator_len,
+                 (const uint8_t *)authorization->coordinator);
+  uint32_t slip44 = coin->coin_type & PATH_UNHARDEN_MASK;
+  hasher_Update(&coinjoin_request_hasher, (uint8_t *)&slip44, sizeof(slip44));
+  hasher_Update(&coinjoin_request_hasher,
+                (const uint8_t *)&coinjoin_request.fee_rate, 4);
+  hasher_Update(&coinjoin_request_hasher,
+                (const uint8_t *)&coinjoin_request.no_fee_threshold, 8);
+  hasher_Update(&coinjoin_request_hasher,
+                (const uint8_t *)&coinjoin_request.min_registrable_amount, 8);
+  hasher_Update(&coinjoin_request_hasher,
+                coinjoin_request.mask_public_key.bytes, 33);
+  ser_length_hash(&coinjoin_request_hasher, msg->inputs_count);
+  return true;
+}
+
+void signing_init(const SignTx *msg, const CoinInfo *_coin, const HDNode *_root,
+                  const AuthorizeCoinJoin *authorization, PathSchema unlock) {
   coin = _coin;
   amount_unit = msg->has_amount_unit ? msg->amount_unit : AmountUnit_BITCOIN;
+  serialize = msg->has_serialize ? msg->serialize : true;
   memcpy(&root, _root, sizeof(HDNode));
+
+  if (msg->inputs_count > MAX_INPUTS_COUNT) {
+    fsm_sendFailure(FailureType_Failure_DataError, _("Too many inputs."));
+    signing_abort();
+    return;
+  }
 
   if (!tx_info_init(&info, msg->inputs_count, msg->outputs_count, msg->version,
                     msg->lock_time, msg->has_expiry, msg->expiry,
@@ -840,32 +1414,50 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
   }
 #endif
 
-  tx_weight = 4 * size;
+  tx_base_weight = 4 * size;
+  tx_weight = tx_base_weight;
+  our_weight = tx_base_weight;
+  our_inputs_len = 0;
 
+  foreign_address_confirmed = false;
+  taproot_only = true;
+  has_unverified_external_input = false;
   signatures = 0;
   idx1 = 0;
   total_in = 0;
+  external_in = 0;
   total_out = 0;
   change_out = 0;
   change_count = 0;
   orig_total_in = 0;
+  orig_external_in = 0;
   orig_total_out = 0;
   orig_change_out = 0;
+  coinjoin_coordination_fee_base = 0;
+  memzero(external_inputs, sizeof(external_inputs));
   memzero(&input, sizeof(TxInputType));
   memzero(&output, sizeof(TxOutputType));
   memzero(&resp, sizeof(TxRequest));
+  memzero(&coinjoin_authorization, sizeof(coinjoin_authorization));
+  memzero(&coinjoin_request, sizeof(coinjoin_request));
+  memzero(&coinjoin_request_hasher, sizeof(coinjoin_request_hasher));
   is_replacement = false;
-  have_orig_verif_input = false;
+  unlocked_schema = unlock;
   signing = true;
-  progress = 0;
-  // we step by 500/inputs_count per input in phase1 and phase2
-  // this means 50 % per phase.
-  progress_step = (500 << PROGRESS_PRECISION) / info.inputs_count;
+  is_coinjoin = (authorization != NULL) ? sectrue : secfalse;
+  if (is_coinjoin == sectrue) {
+    if (!init_coinjoin(msg, authorization)) {
+      return;
+    }
+  }
 
-  next_nonsegwit_input = 0xffffffff;
+  uint32_t branch_id = 0;
+#if !BITCOIN_ONLY
+  branch_id = info.branch_id;
+#endif
 
   tx_init(&to, info.inputs_count, info.outputs_count, info.version,
-          info.lock_time, info.expiry, 0, coin->curve->hasher_sign,
+          info.lock_time, info.expiry, branch_id, 0, coin->curve->hasher_sign,
           coin->overwintered, info.version_group_id, info.timestamp);
 
 #if !BITCOIN_ONLY
@@ -874,97 +1466,120 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin,
     to.is_decred = true;
 
     tx_init(&ti, info.inputs_count, info.outputs_count, info.version,
-            info.lock_time, info.expiry, 0, coin->curve->hasher_sign,
+            info.lock_time, info.expiry, branch_id, 0, coin->curve->hasher_sign,
             coin->overwintered, info.version_group_id, info.timestamp);
     ti.version |= (DECRED_SERIALIZE_NO_WITNESS << 16);
     ti.is_decred = true;
   }
 #endif
 
-  hasher_Init(&hasher_check, coin->curve->hasher_sign);
+  hasher_Init(&hasher_check, HASHER_SHA2);
 
-  layoutProgressSwipe(_("Signing transaction"), 0);
+  init_loading_progress();
 
   send_req_1_input();
 }
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
-static bool is_multisig_input_script_type(const TxInputType *txinput) {
-  if (txinput->script_type == InputScriptType_SPENDMULTISIG ||
-      txinput->script_type == InputScriptType_SPENDP2SHWITNESS ||
-      txinput->script_type == InputScriptType_SPENDWITNESS) {
-    return true;
-  }
-  return false;
-}
-
-static bool is_multisig_output_script_type(const TxOutputType *txoutput) {
-  if (txoutput->script_type == OutputScriptType_PAYTOMULTISIG ||
-      txoutput->script_type == OutputScriptType_PAYTOP2SHWITNESS ||
-      txoutput->script_type == OutputScriptType_PAYTOWITNESS) {
-    return true;
-  }
-  return false;
-}
-
-static bool is_internal_input_script_type(const TxInputType *txinput) {
-  if (txinput->script_type == InputScriptType_SPENDADDRESS ||
-      txinput->script_type == InputScriptType_SPENDMULTISIG ||
-      txinput->script_type == InputScriptType_SPENDP2SHWITNESS ||
-      txinput->script_type == InputScriptType_SPENDWITNESS) {
-    return true;
-  }
-  return false;
-}
-
-static bool is_change_output_script_type(const TxOutputType *txoutput) {
-  if (txoutput->script_type == OutputScriptType_PAYTOADDRESS ||
-      txoutput->script_type == OutputScriptType_PAYTOMULTISIG ||
-      txoutput->script_type == OutputScriptType_PAYTOP2SHWITNESS ||
-      txoutput->script_type == OutputScriptType_PAYTOWITNESS) {
-    return true;
-  }
-  return false;
-}
-
-static bool is_segwit_input_script_type(const TxInputType *txinput) {
-  if (txinput->script_type == InputScriptType_SPENDP2SHWITNESS ||
-      txinput->script_type == InputScriptType_SPENDWITNESS) {
-    return true;
-  }
-  return false;
-}
-
 static bool signing_validate_input(const TxInputType *txinput) {
   if (txinput->prev_hash.size != 32) {
-    fsm_sendFailure(FailureType_Failure_ProcessError,
-                    _("Encountered invalid prevhash"));
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Provided prev_hash is invalid."));
     signing_abort();
     return false;
   }
 
-  if (txinput->has_multisig && !is_multisig_input_script_type(txinput)) {
+  if (txinput->has_multisig &&
+      !is_multisig_input_script_type(txinput->script_type)) {
     fsm_sendFailure(FailureType_Failure_DataError,
                     _("Multisig field provided but not expected."));
     signing_abort();
     return false;
   }
 
-  if (txinput->address_n_count > 0 && !is_internal_input_script_type(txinput)) {
+  if (!txinput->has_multisig &&
+      txinput->script_type == InputScriptType_SPENDMULTISIG) {
     fsm_sendFailure(FailureType_Failure_DataError,
-                    "Input's address_n provided but not expected.");
+                    _("Multisig details required."));
     signing_abort();
     return false;
   }
 
-  if (is_segwit_input_script_type(txinput)) {
+  if (is_internal_input_script_type(txinput->script_type)) {
+    if (txinput->address_n_count == 0) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Missing address_n field."));
+      signing_abort();
+      return false;
+    }
+
+    if (txinput->has_script_pubkey) {
+      // scriptPubKey should only be provided for external inputs
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Input's script_pubkey provided but not expected."));
+      signing_abort();
+      return false;
+    }
+
+    if (txinput->has_ownership_proof) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Ownership proof provided but not expected."));
+      signing_abort();
+      return false;
+    }
+  } else if (txinput->script_type == InputScriptType_EXTERNAL) {
+    if (txinput->address_n_count != 0) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Input's address_n provided but not expected."));
+      signing_abort();
+      return false;
+    }
+
+    if (!txinput->has_script_pubkey) {
+      // scriptPubKey should be provided for external inputs
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Missing script_pubkey field."));
+      signing_abort();
+      return false;
+    }
+  } else {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Unsupported script type."));
+    signing_abort();
+    return false;
+  }
+
+  if (!coin->decred && txinput->has_decred_tree) {
+    fsm_sendFailure(
+        FailureType_Failure_DataError,
+        _("Decred details provided but Decred coin not specified."));
+    signing_abort();
+    return false;
+  }
+
+  if (is_segwit_input_script_type(txinput->script_type)) {
     if (!coin->has_segwit) {
       fsm_sendFailure(FailureType_Failure_DataError,
                       _("Segwit not enabled on this coin"));
       signing_abort();
       return false;
     }
+  }
+
+  if (txinput->script_type == InputScriptType_SPENDTAPROOT &&
+      !coin->has_taproot) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Taproot not enabled on this coin."));
+    signing_abort();
+    return false;
+  }
+
+  if (txinput->has_commitment_data && !txinput->has_ownership_proof) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("commitment_data field provided but not expected."));
+    signing_abort();
+    return false;
   }
 
   if (txinput->has_orig_hash) {
@@ -976,8 +1591,8 @@ static bool signing_validate_input(const TxInputType *txinput) {
     }
 
     if (txinput->orig_hash.size != 32) {
-      fsm_sendFailure(FailureType_Failure_ProcessError,
-                      _("Encountered invalid orig_hash"));
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Provided orig_hash is invalid."));
       signing_abort();
       return false;
     }
@@ -986,8 +1601,28 @@ static bool signing_validate_input(const TxInputType *txinput) {
   return true;
 }
 
+static bool signing_validate_prev_input(const TxInputType *txinput) {
+  if (txinput->prev_hash.size != 32) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Provided prev_hash is invalid."));
+    signing_abort();
+    return false;
+  }
+
+  if (!coin->decred && txinput->has_decred_tree) {
+    fsm_sendFailure(
+        FailureType_Failure_DataError,
+        _("Decred details provided but Decred coin not specified."));
+    signing_abort();
+    return false;
+  }
+
+  return true;
+}
+
 static bool signing_validate_output(TxOutputType *txoutput) {
-  if (txoutput->has_multisig && !is_multisig_output_script_type(txoutput)) {
+  if (txoutput->has_multisig &&
+      !is_multisig_output_script_type(txoutput->script_type)) {
     fsm_sendFailure(FailureType_Failure_DataError,
                     _("Multisig field provided but not expected."));
     signing_abort();
@@ -995,7 +1630,7 @@ static bool signing_validate_output(TxOutputType *txoutput) {
   }
 
   if (txoutput->address_n_count > 0 &&
-      !is_change_output_script_type(txoutput)) {
+      !is_change_output_script_type(txoutput->script_type)) {
     fsm_sendFailure(FailureType_Failure_DataError,
                     _("Output's address_n provided but not expected."));
     signing_abort();
@@ -1036,6 +1671,23 @@ static bool signing_validate_output(TxOutputType *txoutput) {
     }
   }
 
+  if (is_segwit_output_script_type(txoutput->script_type)) {
+    if (!coin->has_segwit) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Segwit not enabled on this coin"));
+      signing_abort();
+      return false;
+    }
+  }
+
+  if (txoutput->script_type == OutputScriptType_PAYTOTAPROOT &&
+      !coin->has_taproot) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Taproot not enabled on this coin."));
+    signing_abort();
+    return false;
+  }
+
   if (txoutput->has_orig_hash) {
     if (!txoutput->has_orig_index) {
       fsm_sendFailure(FailureType_Failure_DataError,
@@ -1056,6 +1708,7 @@ static bool signing_validate_output(TxOutputType *txoutput) {
 }
 
 static bool signing_validate_bin_output(TxOutputBinType *tx_bin_output) {
+#if !BITCOIN_ONLY
   if (!coin->decred && tx_bin_output->has_decred_script_version) {
     fsm_sendFailure(
         FailureType_Failure_DataError,
@@ -1063,82 +1716,270 @@ static bool signing_validate_bin_output(TxOutputBinType *tx_bin_output) {
     signing_abort();
     return false;
   }
+#else
+  (void)tx_bin_output;
+#endif
   return true;
 }
 
 static bool tx_info_add_input(TxInfo *tx_info, const TxInputType *txinput) {
-  // Compute multisig fingerprint for change-output detection. In order for an
-  // output to be considered a change-output, it must have the same fingerprint
-  // as all inputs.
-  if (txinput->has_multisig && !tx_info->multisig_fp_mismatch) {
-    uint8_t h[32] = {0};
-    if (cryptoMultisigFingerprint(&txinput->multisig, h) == 0) {
-      fsm_sendFailure(FailureType_Failure_ProcessError,
-                      _("Error computing multisig fingerprint"));
-      signing_abort();
+  if (txinput->script_type != InputScriptType_EXTERNAL) {
+    // Compute multisig fingerprint for change-output detection. In order for an
+    // output to be considered a change-output, it must have the same
+    // fingerprint as all inputs.
+    if (!extract_input_multisig_fp(tx_info, txinput)) {
       return false;
     }
-    if (tx_info->multisig_fp_set) {
-      if (memcmp(tx_info->multisig_fp, h, 32) != 0) {
-        tx_info->multisig_fp_mismatch = true;
-      }
-    } else {
-      memcpy(tx_info->multisig_fp, h, 32);
-      tx_info->multisig_fp_set = true;
-    }
-  } else {  // single signature
-    tx_info->multisig_fp_mismatch = true;
+
+    // Remember the input's script type. Change-outputs must use the same script
+    // type as all inputs.
+    extract_input_script_type(tx_info, txinput);
+
+    // Remember the input's BIP-32 path. Change-outputs must use the same path
+    // as all inputs.
+    extract_input_bip32_path(tx_info, txinput);
   }
 
-  // Remember the input's BIP-32 path. Change-outputs must use the same path
-  // as all inputs.
-  extract_input_bip32_path(tx_info, txinput);
+  if (is_segwit_input_script_type(txinput->script_type)) {
+    tx_info->segwit_count++;
+  }
 
   // Remember the minimum nSequence value.
   if (txinput->sequence < tx_info->min_sequence) {
     tx_info->min_sequence = txinput->sequence;
   }
 
-  // Add input to BIP-143 hashPrevouts and hashSequence.
+  // Add input to BIP-143 and BIP-341 running sub-hashes.
   tx_prevout_hash(&tx_info->hasher_prevouts, txinput);
-  tx_sequence_hash(&tx_info->hasher_sequence, txinput);
+  tx_amount_hash(&tx_info->hasher_amounts, txinput);
+  tx_script_hash(&tx_info->hasher_scriptpubkeys, txinput->script_pubkey.size,
+                 txinput->script_pubkey.bytes);
+  tx_sequence_hash(&tx_info->hasher_sequences, txinput);
 
   return true;
+}
+
+static bool tx_info_check_input(TxInfo *tx_info, TxInputType *tinput) {
+  bool result = true;
+
+  if (!tx_info->multisig_fp_mismatch) {
+    // check that this is still multisig
+    uint8_t h[32] = {0};
+    if (!tinput->has_multisig ||
+        cryptoMultisigFingerprint(&(tinput->multisig), h) == 0 ||
+        memcmp(tx_info->multisig_fp, h, 32) != 0) {
+      result = false;
+    }
+  }
+
+  if (tx_info->in_script_type_state == MatchState_MATCH) {
+    // check that input script type didn't change
+    if (simple_script_type(tinput->script_type) != tx_info->in_script_type) {
+      result = false;
+    }
+  }
+
+  if (tx_info->in_address_n_count != BIP32_NOCHANGEALLOWED) {
+    // check that input address didn't change
+    size_t count = tinput->address_n_count;
+    if (count < 2 || count != tx_info->in_address_n_count ||
+        0 != memcmp(tx_info->in_address_n, tinput->address_n,
+                    (count - 2) * sizeof(uint32_t))) {
+      result = false;
+    }
+  }
+
+  if (result == false) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Transaction has changed during signing"));
+    signing_abort();
+  }
+  return result;
 }
 
 static bool tx_info_add_output(TxInfo *tx_info,
                                const TxOutputBinType *tx_bin_output) {
-  // Add output to BIP-143 hashOutputs.
+  // Add output to BIP-143/BIP-341 hashOutputs.
   tx_output_hash(&tx_info->hasher_outputs, tx_bin_output, coin->decred);
   return true;
 }
 
+#if !BITCOIN_ONLY
+static void txinfo_fill_zip244_header_hash(TxInfo *tx_info) {
+  // `T.1: header_digest` field.
+  // https://zips.z.cash/zip-0244#t-1-header-digest
+  Hasher hasher = {0};
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, "ZTxIdHeadersHash", 16);
+
+  // T.1a: version (4-byte little-endian version identifier including
+  // overwintered flag)
+  uint32_t ver = tx_info->version | TX_OVERWINTERED;
+  hasher_Update(&hasher, (const uint8_t *)&ver, 4);
+  // T.1b: version_group_id (4-byte little-endian version group identifier)
+  hasher_Update(&hasher, (const uint8_t *)&tx_info->version_group_id, 4);
+  // T.1c: consensus_branch_id (4-byte little-endian consensus branch id)
+  hasher_Update(&hasher, (const uint8_t *)&tx_info->branch_id, 4);
+  // T.1d: lock_time (4-byte little-endian nLockTime value)
+  hasher_Update(&hasher, (const uint8_t *)&tx_info->lock_time, 4);
+  // T.1e: expiry_height (4-byte little-endian block height)
+  hasher_Update(&hasher, (const uint8_t *)&tx_info->expiry, 4);
+  hasher_Final(&hasher, tx_info->hash_header);
+}
+#endif
+
 static void tx_info_finish(TxInfo *tx_info) {
+  hasher_Final(&tx_info->hasher_check, tx_info->hash_inputs_check);
   hasher_Final(&tx_info->hasher_prevouts, tx_info->hash_prevouts);
-  hasher_Final(&tx_info->hasher_sequence, tx_info->hash_sequence);
+  hasher_Final(&tx_info->hasher_amounts, tx_info->hash_amounts);
+  hasher_Final(&tx_info->hasher_scriptpubkeys, tx_info->hash_scriptpubkeys);
+  hasher_Final(&tx_info->hasher_sequences, tx_info->hash_sequences);
   hasher_Final(&tx_info->hasher_outputs, tx_info->hash_outputs);
+
+  if (coin->curve->hasher_sign == HASHER_SHA2D) {
+    hasher_Raw(HASHER_SHA2, tx_info->hash_prevouts,
+               sizeof(tx_info->hash_prevouts), tx_info->hash_prevouts143);
+    hasher_Raw(HASHER_SHA2, tx_info->hash_sequences,
+               sizeof(tx_info->hash_sequences), tx_info->hash_sequence143);
+    hasher_Raw(HASHER_SHA2, tx_info->hash_outputs,
+               sizeof(tx_info->hash_outputs), tx_info->hash_outputs143);
+  } else {
+    memcpy(tx_info->hash_prevouts143, tx_info->hash_prevouts,
+           sizeof(tx_info->hash_prevouts));
+    memcpy(tx_info->hash_sequence143, tx_info->hash_sequences,
+           sizeof(tx_info->hash_sequences));
+    memcpy(tx_info->hash_outputs143, tx_info->hash_outputs,
+           sizeof(tx_info->hash_outputs));
+  }
+
+#if !BITCOIN_ONLY
+  if (coin->overwintered && tx_info->version == 5) {
+    txinfo_fill_zip244_header_hash(tx_info);
+  }
+#endif
 }
 
-static bool signing_check_input(const TxInputType *txinput) {
-  // Add input to BIP143 computation.
+static bool tx_info_check_inputs_hash(TxInfo *tx_info) {
+  uint8_t hash[32];
+  hasher_Final(&tx_info->hasher_check, hash);
+  if (memcmp(hash, tx_info->hash_inputs_check, 32) != 0) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Transaction has changed during signing"));
+    signing_abort();
+    return false;
+  }
+  return true;
+}
+
+static bool tx_info_check_outputs_hash(TxInfo *tx_info) {
+  uint8_t hash[32] = {0};
+  hasher_Final(&tx_info->hasher_check, hash);
+  if (memcmp(hash, tx_info->hash_outputs, 32) != 0) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Transaction has changed during signing"));
+    signing_abort();
+    return false;
+  }
+  return true;
+}
+
+static bool coinjoin_add_input(TxInputType *txi) {
+  // Masks for the signable and no_fee bits in coinjoin_flags.
+  const uint8_t COINJOIN_FLAGS_SIGNABLE = 0x01;
+  const uint8_t COINJOIN_FLAGS_NO_FEE = 0x02;
+
+  hasher_Update(&coinjoin_request_hasher, (uint8_t *)&txi->coinjoin_flags, 1);
+
+  if (txi->script_type == InputScriptType_EXTERNAL) {
+    return true;
+  }
+
+  // Compute the masking bit for the signable bit in coinjoin flags.
+  static CONFIDENTIAL uint8_t output_private_key[32] = {0};
+  uint8_t shared_secret[65] = {0};
+  bool res = (zkp_bip340_tweak_private_key(node.private_key, NULL,
+                                           output_private_key) == 0);
+  res = res && (ecdh_multiply(&secp256k1, output_private_key,
+                              coinjoin_request.mask_public_key.bytes,
+                              shared_secret) == 0);
+  memzero(&output_private_key, sizeof(output_private_key));
+  if (!res) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to derive shared secret."));
+    signing_abort();
+    return false;
+  }
+
+  Hasher mask_hasher = {0};
+  uint8_t mask[SHA256_DIGEST_LENGTH] = {0};
+  hasher_Init(&mask_hasher, HASHER_SHA2);
+  hasher_Update(&mask_hasher, shared_secret + 1, 32);
+  tx_prevout_hash(&mask_hasher, txi);
+  hasher_Final(&mask_hasher, mask);
+
+  // Ensure that the input can be signed.
+  bool signable = (txi->coinjoin_flags ^ mask[0]) & COINJOIN_FLAGS_SIGNABLE;
+  if (!signable) {
+    fsm_sendFailure(FailureType_Failure_ProcessError, _("Unauthorized input"));
+    signing_abort();
+    return false;
+  }
+
+  // Add to coordination_fee_base, except for remixes and small inputs which are
+  // not charged a coordination fee.
+  bool no_fee = txi->coinjoin_flags & COINJOIN_FLAGS_NO_FEE;
+  if (txi->amount > coinjoin_request.no_fee_threshold && !no_fee) {
+    if (!add_amount(&coinjoin_coordination_fee_base, txi->amount)) {
+      return false;
+    }
+  }
+
+  // Since this took a longer time, update progress.
+  report_progress(true);
+  return true;
+}
+
+static bool signing_add_input(TxInputType *txinput) {
+  // hash all input data to check it later (relevant for fee computation)
+  if (!tx_input_check_hash(&info.hasher_check, txinput)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to hash input"));
+    signing_abort();
+    return false;
+  }
+
+  if (txinput->script_type != InputScriptType_EXTERNAL) {
+    // External inputs should have scriptPubKey set by the host.
+    if (!input_validate_path(txinput) || !input_derive_node(txinput) ||
+        !fill_input_script_pubkey(txinput)) {
+      return false;
+    }
+  }
+
+  // Add input to BIP-143/BIP-341 computation.
   if (!tx_info_add_input(&info, txinput)) {
     return false;
   }
 
+  if (is_coinjoin == sectrue) {
+    if (!coinjoin_add_input(txinput)) {
+      return false;
+    }
+  }
+
 #if !BITCOIN_ONLY
   if (coin->decred) {
-    // serialize Decred prefix in Phase 1
-    resp.has_serialized = true;
-    resp.serialized.has_serialized_tx = true;
-    resp.serialized.serialized_tx.size =
-        tx_serialize_input(&to, txinput, resp.serialized.serialized_tx.bytes);
+    if (serialize) {
+      // serialize Decred prefix in Phase 1
+      resp.has_serialized = true;
+      resp.serialized.has_serialized_tx = true;
+      resp.serialized.serialized_tx.size =
+          tx_serialize_input(&to, txinput, resp.serialized.serialized_tx.bytes);
+    }
 
     // compute Decred hashPrefix
     tx_serialize_input_hash(&ti, txinput);
   }
 #endif
-  // hash all input data to check it later (relevant for fee computation)
-  tx_input_check_hash(&hasher_check, txinput);
   return true;
 }
 
@@ -1153,22 +1994,18 @@ static bool signing_check_prevtx_hash(void) {
     return false;
   }
 
+  // prevtx is checked
+  progress_step++;
+  progress_substep = 0;
+
   if (idx1 < info.inputs_count - 1) {
     idx1++;
     send_req_3_input();
   } else {
-    hasher_Final(&hasher_check, hash);
-    if (memcmp(hash, hash_inputs_check, 32) != 0) {
-      fsm_sendFailure(FailureType_Failure_DataError,
-                      _("Transaction has changed during signing"));
-      signing_abort();
+    if (!tx_info_check_inputs_hash(&info)) {
       return false;
     }
 
-    // Everything was checked, now phase 2 begins and the transaction is signed.
-    progress_meta_step =
-        progress_step / (info.inputs_count + info.outputs_count);
-    layoutProgress(_("Signing transaction"), progress);
     idx1 = 0;
 #if !BITCOIN_ONLY
     if (coin->decred) {
@@ -1177,7 +2014,99 @@ static bool signing_check_prevtx_hash(void) {
     } else
 #endif
     {
-      phase2_request_next_input();
+      if (is_replacement) {
+        // Verify original transaction.
+        phase2_request_orig_input();
+      } else {
+        // Proceed to transaction signing.
+        phase2_request_next_input(true);
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool compile_output(TxOutputType *in, TxOutputBinType *out,
+                           bool needs_confirm) {
+  memzero(out, sizeof(TxOutputBinType));
+  out->amount = in->amount;
+  out->decred_script_version = DECRED_SCRIPT_VERSION;
+
+  if (in->script_type == OutputScriptType_PAYTOOPRETURN) {
+    // only 0 satoshi allowed for OP_RETURN
+    if (in->amount != 0 || in->has_address || (in->address_n_count > 0) ||
+        in->has_multisig) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Failed to compile output"));
+      signing_abort();
+      return false;
+    }
+    if (needs_confirm) {
+      if (in->op_return_data.size >= 8 &&
+          memcmp(in->op_return_data.bytes, "omni", 4) ==
+              0) {  // OMNI transaction
+        layoutConfirmOmni(in->op_return_data.bytes, in->op_return_data.size);
+      } else {
+        layoutConfirmOpReturn(in->op_return_data.bytes,
+                              in->op_return_data.size);
+      }
+      if (!protectButton(ButtonRequestType_ButtonRequest_ConfirmOutput,
+                         false)) {
+        fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+        signing_abort();
+        return false;
+      }
+    }
+    op_return_to_script_pubkey(
+        in->op_return_data.bytes, in->op_return_data.size,
+        out->script_pubkey.bytes, &out->script_pubkey.size);
+    return true;
+  }
+
+  if (in->address_n_count > 0) {
+    InputScriptType input_script_type = 0;
+
+    if (!change_output_to_input_script_type(in->script_type,
+                                            &input_script_type)) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Failed to compile output"));
+      signing_abort();
+      return false;
+    }
+    if (!derive_node(input_script_type, in->address_n_count, in->address_n,
+                     in->has_multisig)) {
+      return false;
+    }
+    if (hdnode_fill_public_key(&node) != 0 ||
+        !compute_address(coin, input_script_type, &node, in->has_multisig,
+                         &in->multisig, in->address)) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Failed to compile output"));
+      signing_abort();
+      return false;
+    }
+  } else if (!in->has_address) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to compile output"));
+    signing_abort();
+    return false;
+  }
+
+  if (!address_to_script_pubkey(coin, in->address, out->script_pubkey.bytes,
+                                &out->script_pubkey.size)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to compile output"));
+    signing_abort();
+    return false;
+  }
+
+  if (needs_confirm) {
+    layoutConfirmOutput(coin, amount_unit, in);
+    if (!protectButton(ButtonRequestType_ButtonRequest_ConfirmOutput, false)) {
+      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+      signing_abort();
+      return false;
     }
   }
 
@@ -1186,7 +2115,7 @@ static bool signing_check_prevtx_hash(void) {
 
 static bool is_change_output(const TxInfo *tx_info,
                              const TxOutputType *txoutput) {
-  if (!is_change_output_script_type(txoutput)) {
+  if (!is_change_output_script_type(txoutput->script_type)) {
     return false;
   }
 
@@ -1195,31 +2124,41 @@ static bool is_change_output(const TxInfo *tx_info,
   }
 
   /*
-   * For multisig check that all inputs are multisig
+   * Check the multisig fingerprint only for multisig outputs. This means that
+   * a transfer from a multisig account to a singlesig account is treated as a
+   * change-output as long as all other change-output conditions are satisfied.
+   * This goes a bit against the concept of a multisig account, but the other
+   * cosigners will notice that they are relinquishing control of the funds, so
+   * there is no security risk.
    */
-  if (txoutput->has_multisig) {
-    uint8_t h[32] = {0};
-    if (!tx_info->multisig_fp_set || tx_info->multisig_fp_mismatch ||
-        !cryptoMultisigFingerprint(&(txoutput->multisig), h) ||
-        memcmp(tx_info->multisig_fp, h, 32) != 0) {
-      return false;
-    }
+  if (txoutput->has_multisig && !check_change_multisig_fp(tx_info, txoutput)) {
+    return false;
+  }
+
+  if (!check_change_script_type(tx_info, txoutput)) {
+    return false;
   }
 
   return check_change_bip32_path(tx_info, txoutput);
 }
 
-static bool signing_check_output(TxOutputType *txoutput) {
+static bool signing_add_output(TxOutputType *txoutput) {
   // Phase1: Check outputs
   //   add it to hash_outputs
   //   ask user for permission
 
   bool is_change = is_change_output(&info, txoutput);
 
+  uint32_t output_weight = tx_output_weight(coin, txoutput);
+  tx_weight += output_weight;
+  if (is_change) {
+    our_weight += output_weight;
+  }
+
   // Don't allow adding new external outputs in replacement transactions. There
   // is actually nothing wrong with adding new external outputs, but the only
-  // way to pay for them would be by supplying a new external input, which is
-  // currently not supported.
+  // way to pay for them would be by supplying a new (verified) external input,
+  // which is currently not supported.
   if (is_replacement && !txoutput->has_orig_hash && !is_change) {
     fsm_sendFailure(FailureType_Failure_ProcessError,
                     _("Adding new external outputs in replacement transactions "
@@ -1247,37 +2186,47 @@ static bool signing_check_output(TxOutputType *txoutput) {
     }
   }
 
+  // If address_n is specified, then check that the script type matches.
+  if (txoutput->address_n_count != 0) {
+    InputScriptType script_type = 0;
+    if (!change_output_to_input_script_type(txoutput->script_type,
+                                            &script_type)) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Unsupported script type."));
+      signing_abort();
+      return false;
+    }
+
+    if (!validate_path(script_type, txoutput->address_n_count,
+                       txoutput->address_n, txoutput->has_multisig)) {
+      return false;
+    }
+  }
+
   // Skip confirmation of change-outputs and skip output confirmation altogether
   // in replacement transactions.
-  bool skip_confirm = is_change || is_replacement;
-  int co = compile_output(coin, amount_unit, &root, txoutput, &bin_output,
-                          !skip_confirm);
-  if (!skip_confirm) {
-    layoutProgress(_("Signing transaction"), progress);
+  bool skip_confirm = is_change || is_replacement || (is_coinjoin == sectrue);
+  if (!compile_output(txoutput, &bin_output, !skip_confirm)) {
+    return false;
   }
-  if (co < 0) {
-    fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
-    signing_abort();
-    return false;
-  } else if (co == 0) {
-    fsm_sendFailure(FailureType_Failure_ProcessError,
-                    _("Failed to compile output"));
-    signing_abort();
-    return false;
+  if (!skip_confirm) {
+    report_progress(true);
   }
 #if !BITCOIN_ONLY
   if (coin->decred) {
-    // serialize Decred prefix in Phase 1
-    resp.has_serialized = true;
-    resp.serialized.has_serialized_tx = true;
-    resp.serialized.serialized_tx.size = tx_serialize_output(
-        &to, &bin_output, resp.serialized.serialized_tx.bytes);
+    if (serialize) {
+      // serialize Decred prefix in Phase 1
+      resp.has_serialized = true;
+      resp.serialized.has_serialized_tx = true;
+      resp.serialized.serialized_tx.size = tx_serialize_output(
+          &to, &bin_output, resp.serialized.serialized_tx.bytes);
+    }
 
     // compute Decred hashPrefix
     tx_serialize_output_hash(&ti, &bin_output);
   }
 #endif
-  // Add output to BIP143 computation.
+  // Add output to BIP-143/BIP-341 computation.
   return tx_info_add_output(&info, &bin_output);
 }
 
@@ -1307,37 +2256,68 @@ static bool save_signature(TxInputType *txinput) {
   size = bytes[0];
   bytes += 1;
 
-  // Decode the DER-encoded signature and store in sig.
-  if (bytes[size - 1] != SIGHASH_ALL ||
-      ecdsa_sig_from_der(bytes, size - 1, sig) != 0) {
-    fsm_sendFailure(FailureType_Failure_DataError,
-                    _("Unsupported signature script."));
-    signing_abort();
-    return false;
+  if (txinput->script_type == InputScriptType_SPENDTAPROOT) {
+    if (size != 64) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Unsupported signature script."));
+      signing_abort();
+      return false;
+    }
+    memcpy(sig, bytes, size);
+  } else {
+    // Decode the DER-encoded signature and store in sig.
+    if (bytes[size - 1] != SIGHASH_ALL ||
+        ecdsa_sig_from_der(bytes, size - 1, sig) != 0) {
+      fsm_sendFailure(FailureType_Failure_DataError,
+                      _("Unsupported signature script."));
+      signing_abort();
+      return false;
+    }
   }
 
   return true;
 }
 
-static bool signing_check_orig_input(TxInputType *orig_input) {
+static bool signing_add_orig_input(TxInputType *orig_input) {
+  // hash all input data to check it later
+  if (!tx_input_check_hash(&orig_info.hasher_check, orig_input)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to hash input"));
+    signing_abort();
+    return false;
+  }
+
+  if (orig_input->script_type != InputScriptType_EXTERNAL) {
+    // External inputs should have scriptPubKey set by the host.
+    if (!input_derive_node(orig_input) ||
+        !fill_input_script_pubkey(orig_input)) {
+      return false;
+    }
+  }
+
   // Verify that the original input matches the current input.
   // An input is characterized by its prev_hash and prev_index. We also
   // check that the amounts match, so that we don't have to stream the
   // prevtx twice for the same prevtx output. Verifying that script_type
-  // matches is just a sanity check.
+  // matches is just a sanity check. When all inputs are taproot, we don't
+  // check the prevtxs, so we have to ensure that the claims about the
+  // script_pubkey values and amounts remain consistent throughout.
   if (orig_input->prev_hash.size != input.prev_hash.size ||
       memcmp(orig_input->prev_hash.bytes, input.prev_hash.bytes,
              input.prev_hash.size) != 0 ||
       orig_input->prev_index != input.prev_index ||
       orig_input->amount != input.amount ||
-      orig_input->script_type != input.script_type) {
+      orig_input->script_type != input.script_type ||
+      orig_input->script_pubkey.size != input.script_pubkey.size ||
+      memcmp(orig_input->script_pubkey.bytes, input.script_pubkey.bytes,
+             input.script_pubkey.size) != 0) {
     fsm_sendFailure(FailureType_Failure_ProcessError,
                     _("Original input does not match current input."));
     signing_abort();
     return false;
   }
 
-  // Add input to original BIP143 computation.
+  // Add input to original BIP-143/BIP-341 computation.
   if (!tx_info_add_input(&orig_info, orig_input)) {
     return false;
   }
@@ -1346,7 +2326,7 @@ static bool signing_check_orig_input(TxInputType *orig_input) {
     return false;
   }
 
-  // Add input to original TXID computation before script_sig is overwritten.
+  // Add input to original TXID computation.
   if (!tx_serialize_input_hash(&tp, orig_input)) {
     fsm_sendFailure(FailureType_Failure_ProcessError,
                     _("Failed to serialize input"));
@@ -1354,66 +2334,32 @@ static bool signing_check_orig_input(TxInputType *orig_input) {
     return false;
   }
 
-  // The first original input that has address_n set and a signature gets chosen
-  // as the verification input. Set script_sig for legacy digest computation.
-  if (!have_orig_verif_input && orig_input->address_n_count != 0 &&
-      !orig_input->has_multisig &&
-      ((orig_input->has_script_sig && orig_input->script_sig.size != 0) ||
-       (orig_input->has_witness && orig_input->witness.size > 1))) {
-    // Save the signature before script_sig is overwritten.
-    if (!save_signature(orig_input)) {
-      return false;
+  // Remember the first original internal legacy input.
+  if ((orig_input->script_type == InputScriptType_SPENDMULTISIG ||
+       orig_input->script_type == InputScriptType_SPENDADDRESS) &&
+      !coin->force_bip143 && !coin->overwintered) {
+    if (orig_info.next_legacy_input == 0xffffffff) {
+      orig_info.next_legacy_input = idx2;
     }
-
-    // Derive node.public_key and fill script_sig with the legacy scriptPubKey
-    // (aka BIP-143 script code), which is what our code expects here in order
-    // to properly compute the legacy transaction digest or BIP-143 transaction
-    // digest.
-    if (!fill_input_script_sig(orig_input)) {
-      fsm_sendFailure(FailureType_Failure_ProcessError,
-                      _("Failed to derive public key."));
-      signing_abort();
-      return false;
-    }
-
-    // Save the verification input with script_sig set to scriptPubKey.
-    memcpy(&orig_verif_input, orig_input, sizeof(TxInputType));
-    have_orig_verif_input = true;
-  } else {
-    orig_input->script_sig.size = 0;
-  }
-
-  // Add input to original legacy digest computation now that script_sig is set.
-  if (!tx_serialize_input_hash(&ti, orig_input)) {
-    fsm_sendFailure(FailureType_Failure_ProcessError,
-                    _("Failed to serialize input"));
-    signing_abort();
-    return false;
   }
 
   return true;
 }
 
-static bool signing_check_orig_output(TxOutputType *orig_output) {
+static bool signing_add_orig_output(TxOutputType *orig_output) {
   // Compute scriptPubKey.
   TxOutputBinType orig_bin_output;
-  if (compile_output(coin, amount_unit, &root, orig_output, &orig_bin_output,
-                     false) <= 0) {
-    fsm_sendFailure(FailureType_Failure_ProcessError,
-                    _("Failed to compile output"));
-    signing_abort();
+  if (!compile_output(orig_output, &orig_bin_output, false)) {
     return false;
   }
 
-  // Add output to original BIP143 computation.
+  // Add output to original BIP-143/BIP-341 computation.
   if (!tx_info_add_output(&orig_info, &orig_bin_output)) {
     return false;
   }
 
-  // Add output to the original legacy digest computation (ti) and to the
-  // original TXID computation (tp).
-  if (!tx_serialize_output_hash(&ti, &orig_bin_output) ||
-      !tx_serialize_output_hash(&tp, &orig_bin_output)) {
+  // Add output to original TXID computation.
+  if (!tx_serialize_output_hash(&tp, &orig_bin_output)) {
     fsm_sendFailure(FailureType_Failure_ProcessError,
                     _("Failed to serialize output"));
     signing_abort();
@@ -1485,8 +2431,8 @@ static bool signing_check_orig_output(TxOutputType *orig_output) {
         }
       } else if (output.amount > orig_output->amount) {
         // Only PayJoin transactions may increase the value of external outputs
-        // by supplying an external input. However, external inputs are
-        // currently not supported.
+        // by supplying a verified external input. However, verified external
+        // inputs are currently not supported.
         fsm_sendFailure(
             FailureType_Failure_ProcessError,
             _("Increasing original output amounts is not supported."));
@@ -1499,7 +2445,16 @@ static bool signing_check_orig_output(TxOutputType *orig_output) {
   return true;
 }
 
-static bool signing_confirm_tx(void) {
+static bool payment_confirm_tx(void) {
+  if (has_unverified_external_input) {
+    layoutConfirmUnverifiedExternalInputs();
+    if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
+      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+      signing_abort();
+      return false;
+    }
+  }
+
   if (coin->negative_fee) {
     // bypass check for negative fee coins, required for reward TX
   } else {
@@ -1551,12 +2506,23 @@ static bool signing_confirm_tx(void) {
     }
     uint64_t orig_fee = orig_total_in - orig_total_out;
 
+    // Reject adding external inputs to the original transaction, so that we
+    // don't have to deal with the UI implications. This could be used for
+    // BIP-78 Payjoins when we support presigned external inputs.
+    if (external_in != orig_external_in) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Adding external inputs is not supported."));
+      signing_abort();
+      return false;
+    }
+
     // Sanity check. Replacement transactions are only allowed to make
     // amendments which do not increase the amount that we are spending on
     // external outputs. Additional funds can only go towards the fee, which is
     // confirmed by the user. The check may fail if the replacement transaction
     // starts mixing accounts and breaks change-output identification.
-    if (total_out - change_out > orig_total_out - orig_change_out) {
+    if (total_out - change_out - external_in >
+        orig_total_out - orig_change_out - orig_external_in) {
       fsm_sendFailure(FailureType_Failure_ProcessError,
                       _("Invalid replacement transaction."));
       signing_abort();
@@ -1578,7 +2544,7 @@ static bool signing_confirm_tx(void) {
 
     // Fee modification.
     if (fee != orig_fee) {
-      layoutConfirmModifyFee(coin, amount_unit, orig_fee, fee);
+      layoutConfirmModifyFee(coin, amount_unit, orig_fee, fee, tx_weight);
       if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
         fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
         signing_abort();
@@ -1599,7 +2565,8 @@ static bool signing_confirm_tx(void) {
     }
 
     // last confirmation
-    layoutConfirmTx(coin, amount_unit, total_in, total_out, change_out);
+    layoutConfirmTx(coin, amount_unit, total_in, external_in, total_out,
+                    change_out, tx_weight);
     if (!protectButton(ButtonRequestType_ButtonRequest_SignTx, false)) {
       fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
       signing_abort();
@@ -1610,8 +2577,134 @@ static bool signing_confirm_tx(void) {
   return true;
 }
 
-static uint32_t signing_hash_type(void) {
+static bool coinjoin_confirm_tx(void) {
+  // Minimum registrable output amount accepted by the CoinJoin coordinator. The
+  // CoinJoin request may specify an even lower amount.
+  const uint64_t MIN_REGISTRABLE_OUTPUT_AMOUNT = 5000;
+
+  // Largest possible weight of an output supported by Trezor (P2TR or P2WSH).
+  const uint64_t MAX_OUTPUT_WEIGHT = 4 * (8 + 1 + 1 + 1 + 32);
+
+  // The public key used for verifying coinjoin requests in production on
+  // mainnet.
+  const uint8_t COINJOIN_REQ_PUBKEY[] = {
+      0x02, 0x57, 0x03, 0xbb, 0xe1, 0x5b, 0xb0, 0x8e, 0x98, 0x21, 0xfe,
+      0x64, 0xaf, 0xf6, 0xb2, 0xef, 0x1a, 0x31, 0x60, 0xe3, 0x79, 0x9d,
+      0xd8, 0xf0, 0xce, 0xbf, 0x2c, 0x79, 0xe8, 0x67, 0xdd, 0x12, 0x5d};
+
+  // The public key used for verifying coinjoin requests on testnet and in debug
+  // mode. secp256k1 public key of m/0h for "all all ... all" seed.
+  const uint8_t COINJOIN_REQ_PUBKEY_TEST[] = {
+      0x03, 0x0f, 0xdf, 0x5e, 0x28, 0x9b, 0x5a, 0xef, 0x53, 0x62, 0x90,
+      0x95, 0x3a, 0xe8, 0x1c, 0xe6, 0x0e, 0x84, 0x1f, 0xf9, 0x56, 0xf3,
+      0x66, 0xac, 0x12, 0x3f, 0xa6, 0x9d, 0xb3, 0xc7, 0x9f, 0x21, 0xb0};
+
+  // Finish hashing the CoinJoin request.
+  hasher_Update(&coinjoin_request_hasher, info.hash_prevouts,
+                sizeof(info.hash_prevouts));
+  hasher_Update(&coinjoin_request_hasher, info.hash_outputs,
+                sizeof(info.hash_outputs));
+
+  // Verify the CoinJoin request signature.
+  uint8_t coinjoin_request_digest[SHA256_DIGEST_LENGTH] = {0};
+  hasher_Final(&coinjoin_request_hasher, coinjoin_request_digest);
+  if ((DEBUG_LINK || coin->coin_type == SLIP44_TESTNET) &&
+      ecdsa_verify_digest(&secp256k1, COINJOIN_REQ_PUBKEY_TEST,
+                          coinjoin_request.signature.bytes,
+                          coinjoin_request_digest) == 0) {
+    // success
+  } else if (ecdsa_verify_digest(&secp256k1, COINJOIN_REQ_PUBKEY,
+                                 coinjoin_request.signature.bytes,
+                                 coinjoin_request_digest) == 0) {
+    // success
+  } else {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Invalid signature in coinjoin request."));
+    signing_abort();
+    return false;
+  }
+
+  if (has_unverified_external_input) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Unverifiable external input."));
+    signing_abort();
+    return false;
+  }
+
+  uint64_t mining_fee = 0;
+  if (total_out <= total_in) {
+    mining_fee = total_in - total_out;
+  }
+
+  // The maximum mining fee that the user should be paying.
+  uint64_t our_max_mining_fee =
+      coinjoin_authorization.max_fee_per_kvbyte * ((our_weight + 3) / 4) / 1000;
+
+  // The coordination fee for the user's inputs.
+  uint64_t our_coordination_fee =
+      MIN(coinjoin_request.fee_rate,
+          coinjoin_authorization.max_coordinator_fee_rate) *
+      coinjoin_coordination_fee_base / FEE_RATE_DECIMALS / 100;
+
+  // Total fees that the user is paying.
+  uint64_t our_fees = 0;
+  if (change_out <= total_in - external_in) {
+    our_fees = total_in - external_in - change_out;
+  }
+
+  // For the next step we need to estimate an upper bound on the mining fee used
+  // by the coordinator. The coordinator does not include the base weight of the
+  // transaction when computing the mining fee, so we take this into account.
+  uint64_t max_fee_per_output =
+      MAX_OUTPUT_WEIGHT * mining_fee / (tx_weight - tx_base_weight);
+
+  // Calculate the minimum registrable output amount in a CoinJoin plus the
+  // mining fee that it would cost to register. Amounts below this value are
+  // left to the coordinator or miners and effectively constitute an extra fee
+  // for the user.
+  uint64_t min_allowed_output_amount_plus_fee =
+      MIN(coinjoin_request.min_registrable_amount,
+          MIN_REGISTRABLE_OUTPUT_AMOUNT) +
+      max_fee_per_output;
+
+  if (our_fees > our_coordination_fee + our_max_mining_fee +
+                     min_allowed_output_amount_plus_fee) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Total fee over threshold."));
+    signing_abort();
+    return false;
+  }
+
+  if (coinjoin_authorization.max_rounds < 1) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Exceeded number of coinjoin rounds."));
+    signing_abort();
+    return false;
+  }
+
+  coinjoin_authorization.max_rounds -= 1;
+  if (coinjoin_authorization.max_rounds >= 1) {
+    config_setCoinJoinAuthorization(&coinjoin_authorization);
+  } else {
+    config_setCoinJoinAuthorization(NULL);
+  }
+
+  return true;
+}
+
+static bool signing_confirm_tx(void) {
+  if (is_coinjoin == sectrue) {
+    return coinjoin_confirm_tx();
+  } else {
+    return payment_confirm_tx();
+  }
+}
+
+static uint32_t signing_hash_type(const TxInputType *txinput) {
   uint32_t hash_type = SIGHASH_ALL;
+  if (txinput->script_type == InputScriptType_SPENDTAPROOT) {
+    hash_type = SIGHASH_ALL_TAPROOT;
+  }
 
   if (coin->has_fork_id) {
     hash_type |= (coin->fork_id << 8) | SIGHASH_FORKID;
@@ -1622,16 +2715,16 @@ static uint32_t signing_hash_type(void) {
 
 static void signing_hash_bip143(const TxInfo *tx_info,
                                 const TxInputType *txinput, uint8_t *hash) {
-  uint32_t hash_type = signing_hash_type();
+  uint32_t hash_type = signing_hash_type(txinput);
   Hasher hasher_preimage = {0};
   hasher_Init(&hasher_preimage, coin->curve->hasher_sign);
 
   // nVersion
   hasher_Update(&hasher_preimage, (const uint8_t *)&tx_info->version, 4);
   // hashPrevouts
-  hasher_Update(&hasher_preimage, tx_info->hash_prevouts, 32);
+  hasher_Update(&hasher_preimage, tx_info->hash_prevouts143, 32);
   // hashSequence
-  hasher_Update(&hasher_preimage, tx_info->hash_sequence, 32);
+  hasher_Update(&hasher_preimage, tx_info->hash_sequence143, 32);
   // outpoint
   tx_prevout_hash(&hasher_preimage, txinput);
   // scriptCode
@@ -1642,7 +2735,7 @@ static void signing_hash_bip143(const TxInfo *tx_info,
   // nSequence
   tx_sequence_hash(&hasher_preimage, txinput);
   // hashOutputs
-  hasher_Update(&hasher_preimage, tx_info->hash_outputs, 32);
+  hasher_Update(&hasher_preimage, tx_info->hash_outputs143, 32);
   // nLockTime
   hasher_Update(&hasher_preimage, (const uint8_t *)&tx_info->lock_time, 4);
   // nHashType
@@ -1651,10 +2744,42 @@ static void signing_hash_bip143(const TxInfo *tx_info,
   hasher_Final(&hasher_preimage, hash);
 }
 
+static void signing_hash_bip341(const TxInfo *tx_info, uint32_t i,
+                                uint8_t sighash_type, uint8_t *hash) {
+  const uint8_t zero = 0;
+  Hasher sigmsg_hasher = {0};
+  hasher_Init(&sigmsg_hasher, HASHER_SHA2_TAPSIGHASH);
+  // sighash epoch 0
+  hasher_Update(&sigmsg_hasher, &zero, 1);
+  // nHashType
+  hasher_Update(&sigmsg_hasher, &sighash_type, 1);
+  // nVersion
+  hasher_Update(&sigmsg_hasher, (const uint8_t *)&tx_info->version, 4);
+  // nLockTime
+  hasher_Update(&sigmsg_hasher, (const uint8_t *)&tx_info->lock_time, 4);
+  // sha_prevouts
+  hasher_Update(&sigmsg_hasher, tx_info->hash_prevouts, 32);
+  // sha_amounts
+  hasher_Update(&sigmsg_hasher, tx_info->hash_amounts, 32);
+  // sha_scriptpubkeys
+  hasher_Update(&sigmsg_hasher, tx_info->hash_scriptpubkeys, 32);
+  // sha_sequences
+  hasher_Update(&sigmsg_hasher, tx_info->hash_sequences, 32);
+  // sha_outputs
+  hasher_Update(&sigmsg_hasher, tx_info->hash_outputs, 32);
+  // spend_type 0 (no tapscript message extension, no annex)
+  hasher_Update(&sigmsg_hasher, &zero, 1);
+  // input_index
+  hasher_Update(&sigmsg_hasher, (const uint8_t *)&i, 4);
+
+  hasher_Final(&sigmsg_hasher, hash);
+}
+
 #if !BITCOIN_ONLY
 static void signing_hash_zip243(const TxInfo *tx_info,
                                 const TxInputType *txinput, uint8_t *hash) {
-  uint32_t hash_type = signing_hash_type();
+  uint32_t hash_type = signing_hash_type(txinput);
+  const uint8_t null_bytes[32] = {0};
   uint8_t personal[16] = {0};
   memcpy(personal, "ZcashSigHash", 12);
   memcpy(personal + 12, &tx_info->branch_id, 4);
@@ -1671,22 +2796,21 @@ static void signing_hash_zip243(const TxInfo *tx_info,
   // 3. hashPrevouts
   hasher_Update(&hasher_preimage, tx_info->hash_prevouts, 32);
   // 4. hashSequence
-  hasher_Update(&hasher_preimage, tx_info->hash_sequence, 32);
+  hasher_Update(&hasher_preimage, tx_info->hash_sequences, 32);
   // 5. hashOutputs
   hasher_Update(&hasher_preimage, tx_info->hash_outputs, 32);
   // 6. hashJoinSplits
-  hasher_Update(&hasher_preimage, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
+  hasher_Update(&hasher_preimage, null_bytes, 32);
   // 7. hashShieldedSpends
-  hasher_Update(&hasher_preimage, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
+  hasher_Update(&hasher_preimage, null_bytes, 32);
   // 8. hashShieldedOutputs
-  hasher_Update(&hasher_preimage, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
+  hasher_Update(&hasher_preimage, null_bytes, 32);
   // 9. nLockTime
   hasher_Update(&hasher_preimage, (const uint8_t *)&tx_info->lock_time, 4);
   // 10. expiryHeight
   hasher_Update(&hasher_preimage, (const uint8_t *)&tx_info->expiry, 4);
   // 11. valueBalance
-  hasher_Update(&hasher_preimage,
-                (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00", 8);
+  hasher_Update(&hasher_preimage, null_bytes, 8);
   // 12. nHashType
   hasher_Update(&hasher_preimage, (const uint8_t *)&hash_type, 4);
   // 13a. outpoint
@@ -1702,6 +2826,234 @@ static void signing_hash_zip243(const TxInfo *tx_info,
   hasher_Final(&hasher_preimage, hash);
 }
 #endif
+
+#if !BITCOIN_ONLY
+static void signing_hash_zip244(const TxInfo *tx_info,
+                                const TxInputType *txinput, uint8_t *hash) {
+  Hasher hasher = {0};
+
+  // `S.2g: txin_sig_digest` field for signature digest computation.
+  // https://zips.z.cash/zip-0244#s-2g-txin-sig-digest
+  uint8_t txin_sig_digest[32] = {0};
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, "Zcash___TxInHash", 16);
+  // S.2g.i: prevout (field encoding)
+  tx_prevout_hash(&hasher, txinput);
+  // S.2g.ii: value (8-byte signed little-endian)
+  hasher_Update(&hasher, (const uint8_t *)&txinput->amount, 8);
+  // S.2g.iii: scriptPubKey (field encoding)
+  tx_script_hash(&hasher, txinput->script_pubkey.size,
+                 txinput->script_pubkey.bytes);
+  // S.2g.iv: nSequence (4-byte unsigned little-endian)
+  hasher_Update(&hasher, (const uint8_t *)&txinput->sequence, 4);
+  hasher_Final(&hasher, txin_sig_digest);
+
+  // `S.2: transparent_sig_digest` field for signature digest computation.
+  // https://zips.z.cash/zip-0244#s-2-transparent-sig-digest
+  uint8_t transparent_sig_digest[32] = {0};
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, "ZTxIdTranspaHash", 16);
+  uint32_t hash_type = signing_hash_type(txinput);
+  // S.2a: hash_type (1 byte)
+  hasher_Update(&hasher, (const uint8_t *)&hash_type, 1);
+  // S.2b: prevouts_sig_digest (32-byte hash)
+  hasher_Update(&hasher, tx_info->hash_prevouts,
+                sizeof(tx_info->hash_prevouts));
+  // S.2c: amounts_sig_digest (32-byte hash)
+  hasher_Update(&hasher, tx_info->hash_amounts, sizeof(tx_info->hash_amounts));
+  // S.2d: scriptpubkeys_sig_digest (32-byte hash)
+  hasher_Update(&hasher, tx_info->hash_scriptpubkeys,
+                sizeof(tx_info->hash_scriptpubkeys));
+  // S.2e: sequence_sig_digest (32-byte hash)
+  hasher_Update(&hasher, tx_info->hash_sequences,
+                sizeof(tx_info->hash_sequences));
+  // S.2f: outputs_sig_digest (32-byte hash)
+  hasher_Update(&hasher, tx_info->hash_outputs, sizeof(tx_info->hash_outputs));
+  // S.2g: txin_sig_digest (32-byte hash)
+  hasher_Update(&hasher, txin_sig_digest, sizeof(txin_sig_digest));
+  hasher_Final(&hasher, transparent_sig_digest);
+
+  // `S.3: sapling_digest` field. Empty Sapling bundle.
+  uint8_t sapling_digest[32] = {0};
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, "ZTxIdSaplingHash", 16);
+  hasher_Final(&hasher, sapling_digest);
+
+  // `S.4: orchard_digest` field. Empty Orchard bundle.
+  uint8_t orchard_digest[32] = {0};
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, "ZTxIdOrchardHash", 16);
+  hasher_Final(&hasher, orchard_digest);
+
+  // Final transaction signature digest.
+  // https://zips.z.cash/zip-0244#id13
+  uint8_t personal[16] = {0};
+  memcpy(personal, "ZcashTxHash_", 12);
+  memcpy(personal + 12, &tx_info->branch_id, 4);
+  hasher_InitParam(&hasher, HASHER_BLAKE2B_PERSONAL, personal,
+                   sizeof(personal));
+  // S.1: header_digest (32-byte hash output)
+  hasher_Update(&hasher, tx_info->hash_header, sizeof(tx_info->hash_header));
+  // S.2: transparent_sig_digest (32-byte hash output)
+  hasher_Update(&hasher, transparent_sig_digest,
+                sizeof(transparent_sig_digest));
+  // S.3: sapling_digest (32-byte hash output)
+  hasher_Update(&hasher, sapling_digest, sizeof(sapling_digest));
+  // S.4: orchard_digest (32-byte hash output)
+  hasher_Update(&hasher, orchard_digest, sizeof(orchard_digest));
+  hasher_Final(&hasher, hash);
+}
+#endif
+
+static bool signing_verify_orig_nonlegacy_input(TxInputType *orig_input) {
+  // Nothing to verify for external inputs.
+  if (orig_input->script_type == InputScriptType_EXTERNAL) {
+    return true;
+  }
+
+  // Save the signature before script_sig is overwritten.
+  if (!save_signature(orig_input)) {
+    return false;
+  }
+
+  // Derive node.public_key and fill script_sig with the legacy scriptPubKey
+  // (aka BIP-143 script code), which is what our code expects here in order
+  // to properly compute the BIP-143 transaction digest.
+  if (!input_derive_node(orig_input) || !fill_input_script_sig(orig_input)) {
+    return false;
+  }
+
+  // Compute the signed digest and verify signature.
+  uint8_t hash[32] = {0};
+  uint32_t hash_type = signing_hash_type(orig_input);
+  bool valid = false;
+  if (orig_input->script_type == InputScriptType_SPENDTAPROOT) {
+    signing_hash_bip341(&orig_info, idx1, hash_type & 0xff, hash);
+    uint8_t output_public_key[32] = {0};
+    valid = (zkp_bip340_tweak_public_key(node.public_key + 1, NULL,
+                                         output_public_key) == 0) &&
+            (zkp_bip340_verify_digest(output_public_key, sig, hash) == 0);
+  } else {
+#if !BITCOIN_ONLY
+    if (coin->overwintered) {
+      signing_hash_zip243(&orig_info, orig_input, hash);
+    } else
+#endif
+    {
+      signing_hash_bip143(&orig_info, orig_input, hash);
+    }
+
+    valid = ecdsa_verify_digest(coin->curve->params, node.public_key, sig,
+                                hash) == 0;
+  }
+
+  if (!valid) {
+    fsm_sendFailure(FailureType_Failure_DataError, _("Invalid signature."));
+    signing_abort();
+  }
+
+  return valid;
+}
+
+static bool signing_verify_orig_legacy_input(void) {
+  // Finalize legacy digest computation.
+  uint32_t hash_type = signing_hash_type(&input);
+  hasher_Update(&ti.hasher, (const uint8_t *)&hash_type, 4);
+
+  // Compute the signed digest and verify signature.
+  uint8_t hash[32] = {0};
+  tx_hash_final(&ti, hash, false);
+
+  bool valid = ecdsa_verify_digest(coin->curve->params, pubkey, sig, hash) == 0;
+
+  if (!valid) {
+    fsm_sendFailure(FailureType_Failure_DataError, _("Invalid signature."));
+    signing_abort();
+  }
+
+  return valid;
+}
+
+static bool signing_hash_orig_input(TxInputType *orig_input) {
+  if (idx2 == 0) {
+    uint32_t branch_id = 0;
+#if !BITCOIN_ONLY
+    branch_id = orig_info.branch_id;
+#endif
+    tx_init(&ti, orig_info.inputs_count, orig_info.outputs_count,
+            orig_info.version, orig_info.lock_time, orig_info.expiry, branch_id,
+            0, coin->curve->hasher_sign, coin->overwintered,
+            orig_info.version_group_id, orig_info.timestamp);
+    // Reset the inner transaction check.
+    hasher_Reset(&orig_info.hasher_check);
+  }
+
+  // Add input to the inner transaction check.
+  if (!tx_input_check_hash(&orig_info.hasher_check, orig_input)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to hash input"));
+    signing_abort();
+    return false;
+  }
+
+  if (idx2 == idx1) {
+    // Add input to the outer transaction check.
+    if (!tx_input_check_hash(&hasher_check, orig_input)) {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Failed to hash input"));
+      signing_abort();
+      return false;
+    }
+
+    // Save the signature before script_sig is overwritten.
+    if (!save_signature(orig_input)) {
+      return false;
+    }
+
+    // Derive node.public_key and fill script_sig with the legacy
+    // scriptPubKey which is what our code expects here in order to properly
+    // compute the transaction digest.
+    if (!input_derive_node(orig_input) || !fill_input_script_sig(orig_input)) {
+      return false;
+    }
+
+    memcpy(pubkey, node.public_key, sizeof(pubkey));
+    memcpy(&input, orig_input, sizeof(input));
+  } else {
+    if (orig_info.next_legacy_input == idx1 && idx2 > idx1 &&
+        (orig_input->script_type == InputScriptType_SPENDADDRESS ||
+         orig_input->script_type == InputScriptType_SPENDMULTISIG)) {
+      orig_info.next_legacy_input = idx2;
+    }
+    orig_input->script_sig.size = 0;
+  }
+
+  // Add input to original legacy digest computation now that script_sig is
+  // set.
+  if (!tx_serialize_input_hash(&ti, orig_input)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to serialize input"));
+    signing_abort();
+    return false;
+  }
+
+  return true;
+}
+
+static bool signing_hash_orig_output(TxOutputType *orig_output) {
+  if (!compile_output(orig_output, &bin_output, false)) {
+    return false;
+  }
+
+  // Add the output to the inner transaction check.
+  tx_output_hash(&orig_info.hasher_check, &bin_output, coin->decred);
+
+  // Add the output to original legacy digest computation
+  if (!tx_serialize_output_hash(&ti, &bin_output)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError,
+                    _("Failed to serialize output"));
+    signing_abort();
+    return false;
+  }
+
+  return true;
+}
 
 static bool signing_check_orig_tx(void) {
   uint8_t hash[32] = {0};
@@ -1719,40 +3071,6 @@ static bool signing_check_orig_tx(void) {
     return false;
   }
 
-  if (!have_orig_verif_input) {
-    fsm_sendFailure(FailureType_Failure_ProcessError,
-                    _("The original transaction must specify address_n for at "
-                      "least one input."));
-    signing_abort();
-    return false;
-  }
-
-  // Compute the signed digest.
-#if !BITCOIN_ONLY
-  if (coin->overwintered) {
-    tx_info_finish(&orig_info);
-    signing_hash_zip243(&orig_info, &orig_verif_input, hash);
-  } else
-#endif
-  {
-    if (is_segwit_input_script_type(&orig_verif_input) || coin->force_bip143) {
-      tx_info_finish(&orig_info);
-      signing_hash_bip143(&orig_info, &orig_verif_input, hash);
-    } else {
-      // Finalize legacy digest computation.
-      uint32_t hash_type = signing_hash_type();
-      hasher_Update(&ti.hasher, (const uint8_t *)&hash_type, 4);
-      tx_hash_final(&ti, hash, false);
-    }
-  }
-
-  if (ecdsa_verify_digest(coin->curve->params, node.public_key, sig, hash) !=
-      0) {
-    fsm_sendFailure(FailureType_Failure_DataError, _("Invalid signature."));
-    signing_abort();
-    return false;
-  }
-
   return true;
 }
 
@@ -1764,8 +3082,9 @@ static void phase1_finish(void) {
   }
 #endif
 
-  // Compute BIP143 hashPrevouts, hashSequence and hashOutputs.
+  // Finish computation of BIP-143/BIP-341/ZIP-243 sub-hashes.
   tx_info_finish(&info);
+  tx_info_finish(&orig_info);
 
   if (is_replacement) {
     if (!signing_check_orig_tx()) {
@@ -1777,7 +3096,43 @@ static void phase1_finish(void) {
     return;
   }
 
-  send_req_3_input();
+#if DEBUG_LINK
+  if (!assert_progress_finished()) {
+    return;
+  }
+#endif
+  // Now phase 2 begins and the transaction is signed.
+  init_signing_progress();
+
+  if (taproot_only) {
+    // All internal inputs are Taproot. We do not need to verify that their
+    // parameters match previous transactions. We can trust the amounts and
+    // scriptPubKeys, because if an invalid value is provided then all issued
+    // signatures will be invalid.
+    if (is_replacement) {
+      // Verify original transaction.
+      phase2_request_orig_input();
+    } else {
+      // Proceed directly to transaction signing.
+      phase2_request_next_input(true);
+    }
+#if !BITCOIN_ONLY
+  } else if (coin->overwintered && info.version == 5) {
+    // ZIP-244 transactions are treated same as Taproot.
+    phase2_request_next_input(true);
+#endif
+  } else {
+    // There are internal non-Taproot inputs. We need to verify all inputs,
+    // because we can't trust any amounts or scriptPubKeys. If we did, then an
+    // attacker who provides invalid information about amounts, scriptPubKeys
+    // and/or script types may still obtain valid signatures for legacy and
+    // SegWit v0 inputs. These valid signatures could be exploited in subsequent
+    // signing operations to falsely claim externality of the already signed
+    // inputs or to falsely claim that a transaction is a replacement of an
+    // already approved transaction or to construct a valid transaction by
+    // combining signatures obtained in multiple rounds of the attack.
+    send_req_3_input();
+  }
 }
 
 static void phase1_request_next_output(void) {
@@ -1829,8 +3184,9 @@ static void phase1_request_orig_output(void) {
 }
 
 #if !BITCOIN_ONLY
-static void signing_hash_decred(const uint8_t *hash_witness, uint8_t *hash) {
-  uint32_t hash_type = signing_hash_type();
+static void signing_hash_decred(const TxInputType *txinput,
+                                const uint8_t *hash_witness, uint8_t *hash) {
+  uint32_t hash_type = signing_hash_type(txinput);
   Hasher hasher_preimage = {0};
   hasher_Init(&hasher_preimage, coin->curve->hasher_sign);
   hasher_Update(&hasher_preimage, (const uint8_t *)&hash_type, 4);
@@ -1840,22 +3196,22 @@ static void signing_hash_decred(const uint8_t *hash_witness, uint8_t *hash) {
 }
 #endif
 
-static bool signing_sign_hash(TxInputType *txinput, const uint8_t *private_key,
-                              const uint8_t *public_key, const uint8_t *hash) {
+static bool signing_sign_ecdsa(TxInputType *txinput, const uint8_t *private_key,
+                               const uint8_t *public_key, const uint8_t *hash) {
+  resp.has_serialized = true;
   resp.serialized.has_signature_index = true;
   resp.serialized.signature_index = idx1;
   resp.serialized.has_signature = true;
-  resp.serialized.has_serialized_tx = true;
-  if (ecdsa_sign_digest(coin->curve->params, private_key, hash, sig, NULL,
-                        NULL) != 0) {
+
+  if (!tx_sign_ecdsa(coin->curve->params, private_key, hash,
+                     resp.serialized.signature.bytes,
+                     &resp.serialized.signature.size)) {
     fsm_sendFailure(FailureType_Failure_ProcessError, _("Signing failed"));
     signing_abort();
     return false;
   }
-  resp.serialized.signature.size =
-      ecdsa_sig_to_der(sig, resp.serialized.signature.bytes);
 
-  uint8_t sighash = signing_hash_type() & 0xff;
+  uint8_t sighash = signing_hash_type(txinput) & 0xff;
   if (txinput->has_multisig) {
     // fill in the signature
     int pubkey_idx =
@@ -1886,23 +3242,38 @@ static bool signing_sign_hash(TxInputType *txinput, const uint8_t *private_key,
   return true;
 }
 
-static bool signing_sign_input(void) {
-  uint8_t hash[32] = {0};
-  hasher_Final(&hasher_check, hash);
-  if (memcmp(hash, info.hash_outputs, 32) != 0) {
-    fsm_sendFailure(FailureType_Failure_DataError,
-                    _("Transaction has changed during signing"));
+static bool signing_sign_bip340(const uint8_t *private_key,
+                                const uint8_t *hash) {
+  resp.has_serialized = true;
+  resp.serialized.has_signature_index = true;
+  resp.serialized.signature_index = idx1;
+  resp.serialized.has_signature = true;
+
+  if (!tx_sign_bip340(private_key, hash, resp.serialized.signature.bytes,
+                      &resp.serialized.signature.size)) {
+    fsm_sendFailure(FailureType_Failure_ProcessError, _("Signing failed"));
     signing_abort();
     return false;
   }
 
-  uint32_t hash_type = signing_hash_type();
+  return true;
+}
+
+static bool signing_sign_legacy_input(void) {
+  // Finalize legacy digest computation.
+  uint32_t hash_type = signing_hash_type(&input);
   hasher_Update(&ti.hasher, (const uint8_t *)&hash_type, 4);
+
+  // Compute the digest and generate signature.
+  uint8_t hash[32] = {0};
   tx_hash_final(&ti, hash, false);
-  resp.has_serialized = true;
-  if (!signing_sign_hash(&input, privkey, pubkey, hash)) return false;
-  resp.serialized.serialized_tx.size =
-      tx_serialize_input(&to, &input, resp.serialized.serialized_tx.bytes);
+  if (!signing_sign_ecdsa(&input, privkey, pubkey, hash)) return false;
+  if (serialize) {
+    resp.has_serialized = true;
+    resp.serialized.has_serialized_tx = true;
+    resp.serialized.serialized_tx.size =
+        tx_serialize_input(&to, &input, resp.serialized.serialized_tx.bytes);
+  }
   return true;
 }
 
@@ -1910,72 +3281,112 @@ static bool signing_sign_segwit_input(TxInputType *txinput) {
   // idx1: index to sign
   uint8_t hash[32] = {0};
 
-  if (is_segwit_input_script_type(txinput)) {
+  if (is_external_input(idx1) !=
+      (txinput->script_type == InputScriptType_EXTERNAL)) {
+    fsm_sendFailure(FailureType_Failure_DataError,
+                    _("Transaction has changed during signing"));
+    signing_abort();
+    return false;
+  }
+
+  if (txinput->script_type == InputScriptType_SPENDTAPROOT) {
+    signing_hash_bip341(&info, idx1, signing_hash_type(txinput), hash);
+
+    if (!input_validate_path(txinput) || !tx_info_check_input(&info, txinput) ||
+        !input_derive_node(txinput) ||
+        !signing_sign_bip340(node.private_key, hash)) {
+      return false;
+    }
+
+    if (serialize) {
+      resp.has_serialized = true;
+      resp.serialized.has_serialized_tx = true;
+      resp.serialized.serialized_tx.size = serialize_p2tr_witness(
+          resp.serialized.signature.bytes, resp.serialized.signature.size, 0,
+          resp.serialized.serialized_tx.bytes);
+    }
+  } else if (txinput->script_type == InputScriptType_SPENDP2SHWITNESS ||
+             txinput->script_type == InputScriptType_SPENDWITNESS) {
     if (!txinput->has_amount) {
       fsm_sendFailure(FailureType_Failure_DataError,
                       _("Segwit input without amount"));
       signing_abort();
       return false;
     }
-    if (!compile_input_script_sig(txinput)) {
+
+    if (taproot_only) {
       fsm_sendFailure(FailureType_Failure_ProcessError,
-                      _("Failed to compile input"));
+                      _("Transaction has changed during signing"));
       signing_abort();
+      return false;
+    }
+
+    if (!input_validate_path(txinput) || !tx_info_check_input(&info, txinput) ||
+        !input_derive_node(txinput) || !fill_input_script_sig(txinput)) {
       return false;
     }
 
     signing_hash_bip143(&info, txinput, hash);
 
-    resp.has_serialized = true;
-    if (!signing_sign_hash(txinput, node.private_key, node.public_key, hash))
+    if (!signing_sign_ecdsa(txinput, node.private_key, node.public_key, hash))
       return false;
 
-    uint8_t sighash = signing_hash_type() & 0xff;
-    if (txinput->has_multisig) {
-      uint32_t r = 1;  // skip number of items (filled in later)
-      resp.serialized.serialized_tx.bytes[r] = 0;
-      r++;
-      int nwitnesses = 2;
-      for (uint32_t i = 0; i < txinput->multisig.signatures_count; i++) {
-        if (txinput->multisig.signatures[i].size == 0) {
-          continue;
-        }
-        nwitnesses++;
-        txinput->multisig.signatures[i]
-            .bytes[txinput->multisig.signatures[i].size] = sighash;
-        r += tx_serialize_script(txinput->multisig.signatures[i].size + 1,
-                                 txinput->multisig.signatures[i].bytes,
-                                 resp.serialized.serialized_tx.bytes + r);
-      }
-      uint32_t script_len =
-          compile_script_multisig(coin, &txinput->multisig, 0);
-      r += ser_length(script_len, resp.serialized.serialized_tx.bytes + r);
-      r += compile_script_multisig(coin, &txinput->multisig,
+    if (serialize) {
+      resp.has_serialized = true;
+      resp.serialized.has_serialized_tx = true;
+      uint8_t sighash = signing_hash_type(txinput) & 0xff;
+      if (txinput->has_multisig) {
+        uint32_t r = 1;  // skip number of items (filled in later)
+        resp.serialized.serialized_tx.bytes[r] = 0;
+        r++;
+        int nwitnesses = 2;
+        for (uint32_t i = 0; i < txinput->multisig.signatures_count; i++) {
+          if (txinput->multisig.signatures[i].size == 0) {
+            continue;
+          }
+          nwitnesses++;
+          txinput->multisig.signatures[i]
+              .bytes[txinput->multisig.signatures[i].size] = sighash;
+          r += tx_serialize_script(txinput->multisig.signatures[i].size + 1,
+                                   txinput->multisig.signatures[i].bytes,
                                    resp.serialized.serialized_tx.bytes + r);
-      resp.serialized.serialized_tx.bytes[0] = nwitnesses;
-      resp.serialized.serialized_tx.size = r;
-    } else {  // single signature
-      uint32_t r = 0;
-      r += ser_length(2, resp.serialized.serialized_tx.bytes + r);
-      resp.serialized.signature.bytes[resp.serialized.signature.size] = sighash;
-      r += tx_serialize_script(resp.serialized.signature.size + 1,
-                               resp.serialized.signature.bytes,
-                               resp.serialized.serialized_tx.bytes + r);
-      r += tx_serialize_script(33, node.public_key,
-                               resp.serialized.serialized_tx.bytes + r);
-      resp.serialized.serialized_tx.size = r;
+        }
+        uint32_t script_len =
+            compile_script_multisig(coin, &txinput->multisig, 0);
+        r += ser_length(script_len, resp.serialized.serialized_tx.bytes + r);
+        r += compile_script_multisig(coin, &txinput->multisig,
+                                     resp.serialized.serialized_tx.bytes + r);
+        resp.serialized.serialized_tx.bytes[0] = nwitnesses;
+        resp.serialized.serialized_tx.size = r;
+      } else {  // single signature
+        resp.serialized.serialized_tx.size = serialize_p2wpkh_witness(
+            resp.serialized.signature.bytes, resp.serialized.signature.size,
+            node.public_key, 33, sighash, resp.serialized.serialized_tx.bytes);
+      }
     }
   } else {
-    // empty witness
-    resp.has_serialized = true;
-    resp.serialized.has_signature_index = false;
-    resp.serialized.has_signature = false;
-    resp.serialized.has_serialized_tx = true;
-    resp.serialized.serialized_tx.bytes[0] = 0;
-    resp.serialized.serialized_tx.size = 1;
+    if (serialize) {
+      // no signature to be generated
+      resp.has_serialized = true;
+      resp.serialized.has_signature_index = false;
+      resp.serialized.has_signature = false;
+      resp.serialized.has_serialized_tx = true;
+      if (txinput->script_type == InputScriptType_EXTERNAL &&
+          txinput->has_witness) {
+        // fill in the provided witness
+        memcpy(resp.serialized.serialized_tx.bytes, txinput->witness.bytes,
+               txinput->witness.size);
+        resp.serialized.serialized_tx.size = txinput->witness.size;
+      } else {
+        // empty witness
+        resp.serialized.serialized_tx.bytes[0] = 0;
+        resp.serialized.serialized_tx.size = 1;
+      }
+    }
   }
+
   //  if last witness add tx footer
-  if (idx1 == info.inputs_count - 1) {
+  if (serialize && idx1 == info.inputs_count - 1) {
     uint32_t r = resp.serialized.serialized_tx.size;
     r += tx_serialize_footer(&to, resp.serialized.serialized_tx.bytes + r);
     resp.serialized.serialized_tx.size = r;
@@ -1988,12 +3399,15 @@ static bool signing_sign_segwit_input(TxInputType *txinput) {
 static bool signing_sign_decred_input(TxInputType *txinput) {
   uint8_t hash[32] = {}, hash_witness[32] = {};
   tx_hash_final(&ti, hash_witness, false);
-  signing_hash_decred(hash_witness, hash);
-  resp.has_serialized = true;
-  if (!signing_sign_hash(txinput, node.private_key, node.public_key, hash))
+  signing_hash_decred(txinput, hash_witness, hash);
+  if (!signing_sign_ecdsa(txinput, node.private_key, node.public_key, hash))
     return false;
-  resp.serialized.serialized_tx.size = tx_serialize_decred_witness(
-      &to, txinput, resp.serialized.serialized_tx.bytes);
+  if (serialize) {
+    resp.has_serialized = true;
+    resp.serialized.has_serialized_tx = true;
+    resp.serialized.serialized_tx.size = tx_serialize_decred_witness(
+        &to, txinput, resp.serialized.serialized_tx.bytes);
+  }
   return true;
 }
 
@@ -2009,18 +3423,15 @@ void signing_txack(TransactionType *tx) {
     return;
   }
 
-  static int update_ctr = 0;
-  if (update_ctr++ == 20) {
-    layoutProgress(_("Signing transaction"), progress);
-    update_ctr = 0;
-  }
+  report_progress(false);
 
   memzero(&resp, sizeof(TxRequest));
 
   switch (signing_stage) {
     case STAGE_REQUEST_1_INPUT:
+      progress_step++;
       if (!signing_validate_input(&tx->inputs[0]) ||
-          !signing_check_input(&tx->inputs[0])) {
+          !signing_add_input(&tx->inputs[0])) {
         return;
       }
 
@@ -2035,12 +3446,22 @@ void signing_txack(TransactionType *tx) {
         return;
       }
 
-      tx_weight += tx_input_weight(coin, &tx->inputs[0]);
+      uint32_t input_weight = tx_input_weight(coin, &tx->inputs[0]);
 #if !BITCOIN_ONLY
       if (coin->decred) {
-        tx_weight += tx_decred_witness_weight(&tx->inputs[0]);
+        input_weight += tx_decred_witness_weight(&tx->inputs[0]);
       }
 #endif
+      tx_weight += input_weight;
+      if (is_internal_input_script_type(tx->inputs[0].script_type)) {
+        our_weight += input_weight;
+        our_inputs_len += 1;
+      }
+
+      if (tx->inputs[0].script_type != InputScriptType_SPENDTAPROOT &&
+          tx->inputs[0].script_type != InputScriptType_EXTERNAL) {
+        taproot_only = false;
+      }
 
       if (tx->inputs[0].script_type == InputScriptType_SPENDMULTISIG ||
           tx->inputs[0].script_type == InputScriptType_SPENDADDRESS) {
@@ -2058,12 +3479,11 @@ void signing_txack(TransactionType *tx) {
         if (!coin->force_bip143 && !coin->overwintered) {
           // remember the first non-segwit input -- this is the first input
           // we need to sign during phase2
-          if (next_nonsegwit_input == 0xffffffff) next_nonsegwit_input = idx1;
+          if (info.next_legacy_input == 0xffffffff) {
+            info.next_legacy_input = idx1;
+          }
         }
-      } else if (is_segwit_input_script_type(&tx->inputs[0])) {
-        if (!to.is_segwit) {
-          tx_weight += TXSIZE_SEGWIT_OVERHEAD + to.inputs_len;
-        }
+      } else if (is_segwit_input_script_type(tx->inputs[0].script_type)) {
 #if !ENABLE_SEGWIT_NONSEGWIT_MIXING
         // don't mix segwit and non-segwit inputs
         if (idx1 == 0) {
@@ -2078,6 +3498,42 @@ void signing_txack(TransactionType *tx) {
 #else
         to.is_segwit = true;
 #endif
+      } else if (tx->inputs[0].script_type == InputScriptType_EXTERNAL) {
+        if (tx->inputs[0].has_ownership_proof) {
+          uint8_t ownership_id[OWNERSHIP_ID_SIZE] = {0};
+          if (!fsm_getOwnershipId(tx->inputs[0].script_pubkey.bytes,
+                                  tx->inputs[0].script_pubkey.size,
+                                  ownership_id)) {
+            signing_abort();
+            return;
+          }
+
+          if (!tx_input_verify_nonownership(coin, tx->inputs, ownership_id)) {
+            fsm_sendFailure(FailureType_Failure_DataError,
+                            _("Invalid external input."));
+            signing_abort();
+            return;
+          }
+
+          if (!add_amount(&external_in, tx->inputs[0].amount)) {
+            return;
+          }
+
+          if (tx->inputs[0].has_orig_hash) {
+            if (!add_amount(&orig_external_in, tx->inputs[0].amount)) {
+              return;
+            }
+          }
+        } else {
+          has_unverified_external_input = true;
+          if (config_getSafetyCheckLevel() == SafetyCheckLevel_Strict) {
+            fsm_sendFailure(FailureType_Failure_ProcessError,
+                            _("Unverifiable external input."));
+            signing_abort();
+            return;
+          }
+        }
+        set_external_input(idx1);
       } else {
         fsm_sendFailure(FailureType_Failure_DataError,
                         _("Wrong input script type"));
@@ -2086,6 +3542,15 @@ void signing_txack(TransactionType *tx) {
       }
 
       if (tx->inputs[0].has_orig_hash) {
+#if !BITCOIN_ONLY
+        if (coin->overwintered && info.version != 4) {
+          fsm_sendFailure(FailureType_Failure_ProcessError,
+                          _("Replacement transactions are not supported."));
+          signing_abort();
+          return;
+        }
+#endif
+
         memcpy(&input, &tx->inputs[0], sizeof(input));
         phase1_request_orig_input();
       } else {
@@ -2116,21 +3581,17 @@ void signing_txack(TransactionType *tx) {
         return;
       }
 
-      // Initialize computation of original legacy digest.
-      tx_init(&ti, tx->inputs_cnt, tx->outputs_cnt, tx->version, tx->lock_time,
-              tx->expiry, 0, coin->curve->hasher_sign, coin->overwintered,
-              tx->version_group_id, tx->timestamp);
-
       // Initialize computation of original TXID.
       tx_init(&tp, tx->inputs_cnt, tx->outputs_cnt, tx->version, tx->lock_time,
-              tx->expiry, tx->extra_data_len, coin->curve->hasher_sign,
-              coin->overwintered, tx->version_group_id, tx->timestamp);
+              tx->expiry, tx->branch_id, tx->extra_data_len,
+              coin->curve->hasher_sign, coin->overwintered,
+              tx->version_group_id, tx->timestamp);
 
       phase1_request_orig_input();
       return;
     case STAGE_REQUEST_1_ORIG_INPUT:
       if (!signing_validate_input(tx->inputs) ||
-          !signing_check_orig_input(tx->inputs)) {
+          !signing_add_orig_input(tx->inputs)) {
         return;
       }
 
@@ -2138,11 +3599,11 @@ void signing_txack(TransactionType *tx) {
       phase1_request_next_input();
       return;
     case STAGE_REQUEST_2_OUTPUT:
+      progress_step++;
       if (!signing_validate_output(&tx->outputs[0]) ||
-          !signing_check_output(&tx->outputs[0])) {
+          !signing_add_output(&tx->outputs[0])) {
         return;
       }
-      tx_weight += tx_output_weight(coin, &tx->outputs[0]);
 
       if (tx->outputs[0].has_orig_hash) {
         memcpy(&output, &tx->outputs[0], sizeof(output));
@@ -2153,7 +3614,7 @@ void signing_txack(TransactionType *tx) {
       return;
     case STAGE_REQUEST_2_ORIG_OUTPUT:
       if (!signing_validate_output(tx->outputs) ||
-          !signing_check_orig_output(tx->outputs)) {
+          !signing_add_orig_output(tx->outputs)) {
         return;
       }
 
@@ -2192,7 +3653,18 @@ void signing_txack(TransactionType *tx) {
       return;
 #endif
     case STAGE_REQUEST_3_INPUT:
-      if (!signing_validate_input(&tx->inputs[0])) {
+      if (idx1 == 0) {
+        hasher_Reset(&info.hasher_check);
+      }
+
+      if (!signing_validate_input(tx->inputs)) {
+        return;
+      }
+
+      if (!tx_input_check_hash(&info.hasher_check, tx->inputs)) {
+        fsm_sendFailure(FailureType_Failure_ProcessError,
+                        _("Failed to hash input"));
+        signing_abort();
         return;
       }
 
@@ -2203,12 +3675,14 @@ void signing_txack(TransactionType *tx) {
         return;
       }
 
-      if (idx1 == 0) {
-        hasher_Reset(&hasher_check);
-      }
-      tx_input_check_hash(&hasher_check, tx->inputs);
-
       memcpy(&input, tx->inputs, sizeof(TxInputType));
+
+      if (input.script_type != InputScriptType_EXTERNAL) {
+        // External inputs should have scriptPubKey set by the host.
+        if (!input_derive_node(&input) || !fill_input_script_pubkey(&input)) {
+          return;
+        }
+      }
 
       send_req_3_prev_meta();
       return;
@@ -2277,15 +3751,16 @@ void signing_txack(TransactionType *tx) {
         return;
       }
       tx_init(&tp, tx->inputs_cnt, tx->outputs_cnt, tx->version, tx->lock_time,
-              tx->expiry, tx->extra_data_len, coin->curve->hasher_sign,
-              coin->overwintered, tx->version_group_id, tx->timestamp);
+              tx->expiry, tx->branch_id, tx->extra_data_len,
+              coin->curve->hasher_sign, coin->overwintered,
+              tx->version_group_id, tx->timestamp);
 #if !BITCOIN_ONLY
       if (coin->decred) {
         tp.version |= (DECRED_SERIALIZE_NO_WITNESS << 16);
         tp.is_decred = true;
       }
 #endif
-      progress_meta_step = progress_step / (tp.inputs_len + tp.outputs_len);
+      progress_substeps = tp.inputs_len + tp.outputs_len;
       idx2 = 0;
       if (tp.inputs_len > 0) {
         send_req_3_prev_input();
@@ -2295,11 +3770,10 @@ void signing_txack(TransactionType *tx) {
       }
       return;
     case STAGE_REQUEST_3_PREV_INPUT:
-      if (!signing_validate_input(&tx->inputs[0])) {
+      if (!signing_validate_prev_input(&tx->inputs[0])) {
         return;
       }
-      progress = (idx1 * progress_step + idx2 * progress_meta_step) >>
-                 PROGRESS_PRECISION;
+      progress_substep++;
       if (!tx_serialize_input_hash(&tp, tx->inputs)) {
         fsm_sendFailure(FailureType_Failure_ProcessError,
                         _("Failed to serialize input"));
@@ -2318,9 +3792,7 @@ void signing_txack(TransactionType *tx) {
       if (!signing_validate_bin_output(&tx->bin_outputs[0])) {
         return;
       }
-      progress = (idx1 * progress_step +
-                  (tp.inputs_len + idx2) * progress_meta_step) >>
-                 PROGRESS_PRECISION;
+      progress_substep++;
       if (!tx_serialize_output_hash(&tp, tx->bin_outputs)) {
         fsm_sendFailure(FailureType_Failure_ProcessError,
                         _("Failed to serialize output"));
@@ -2331,6 +3803,15 @@ void signing_txack(TransactionType *tx) {
         if (input.amount != tx->bin_outputs[0].amount) {
           fsm_sendFailure(FailureType_Failure_DataError,
                           _("Invalid amount specified"));
+          signing_abort();
+          return;
+        }
+        if (input.script_pubkey.size != tx->bin_outputs[0].script_pubkey.size ||
+            memcmp(input.script_pubkey.bytes,
+                   tx->bin_outputs[0].script_pubkey.bytes,
+                   input.script_pubkey.size) != 0) {
+          fsm_sendFailure(FailureType_Failure_DataError,
+                          _("Input does not match scriptPubKey"));
           signing_abort();
           return;
         }
@@ -2345,7 +3826,7 @@ void signing_txack(TransactionType *tx) {
 #endif
       }
       if (idx2 < tp.outputs_len - 1) {
-        /* Check prevtx of next input */
+        /* Check next output of prevtx */
         idx2++;
         send_req_3_prev_output();
 #if !BITCOIN_ONLY
@@ -2381,36 +3862,116 @@ void signing_txack(TransactionType *tx) {
       }
       return;
 #endif
+
+    case STAGE_REQUEST_3_ORIG_NONLEGACY_INPUT:
+      if (!signing_validate_input(tx->inputs)) {
+        return;
+      }
+      progress_step++;
+
+      // Add input to the outer transaction check.
+      if (!tx_input_check_hash(&hasher_check, tx->inputs)) {
+        fsm_sendFailure(FailureType_Failure_ProcessError,
+                        _("Failed to hash input"));
+        signing_abort();
+        return;
+      }
+
+      if (!signing_verify_orig_nonlegacy_input(tx->inputs)) {
+        return;
+      }
+
+      idx1++;
+      phase2_request_orig_input();
+      return;
+
+    case STAGE_REQUEST_3_ORIG_INPUT:
+      if (!signing_validate_input(tx->inputs) ||
+          !signing_hash_orig_input(tx->inputs)) {
+        return;
+      }
+      progress_step++;
+
+      idx2++;
+      if (idx2 < orig_info.inputs_count) {
+        send_req_3_orig_input();
+      } else {
+        // Ensure that the original transaction inputs haven't changed for the
+        // inner transaction check.
+        if (!tx_info_check_inputs_hash(&orig_info)) {
+          return;
+        }
+
+        // Reset the inner transaction check.
+        hasher_Reset(&orig_info.hasher_check);
+        idx2 = 0;
+        send_req_3_orig_output();
+      }
+
+      return;
+
+    case STAGE_REQUEST_3_ORIG_OUTPUT:
+      if (!signing_validate_output(tx->outputs) ||
+          !signing_hash_orig_output(tx->outputs)) {
+        return;
+      }
+      progress_step++;
+
+      idx2++;
+      if (idx2 < orig_info.outputs_count) {
+        send_req_3_orig_output();
+      } else {
+        // Ensure that the original transaction outputs haven't changed for the
+        // inner transaction check.
+        if (!tx_info_check_outputs_hash(&orig_info)) {
+          return;
+        }
+
+        // Verify original signature.
+        if (!signing_verify_orig_legacy_input()) {
+          return;
+        }
+
+        idx1++;
+        phase2_request_orig_input();
+      }
+
+      return;
+
     case STAGE_REQUEST_4_INPUT:
       if (!signing_validate_input(&tx->inputs[0])) {
         return;
       }
-      progress =
-          500 + ((signatures * progress_step + idx2 * progress_meta_step) >>
-                 PROGRESS_PRECISION);
+      progress_step++;
+
       if (idx2 == 0) {
         tx_init(&ti, info.inputs_count, info.outputs_count, info.version,
-                info.lock_time, info.expiry, 0, coin->curve->hasher_sign,
-                coin->overwintered, info.version_group_id, info.timestamp);
-        hasher_Reset(&hasher_check);
+                info.lock_time, info.expiry, tx->branch_id, 0,
+                coin->curve->hasher_sign, coin->overwintered,
+                info.version_group_id, info.timestamp);
+        hasher_Reset(&info.hasher_check);
       }
       // check inputs are the same as those in phase 1
-      tx_input_check_hash(&hasher_check, tx->inputs);
+      if (!tx_input_check_hash(&info.hasher_check, tx->inputs)) {
+        fsm_sendFailure(FailureType_Failure_ProcessError,
+                        _("Failed to hash input"));
+        signing_abort();
+        return;
+      }
       if (idx2 == idx1) {
-        if (!compile_input_script_sig(&tx->inputs[0])) {
-          fsm_sendFailure(FailureType_Failure_ProcessError,
-                          _("Failed to compile input"));
-          signing_abort();
+        if (!tx_info_check_input(&info, &tx->inputs[0]) ||
+            !input_derive_node(&tx->inputs[0]) ||
+            !fill_input_script_sig(&tx->inputs[0])) {
           return;
         }
         memcpy(&input, &tx->inputs[0], sizeof(input));
         memcpy(privkey, node.private_key, 32);
         memcpy(pubkey, node.public_key, 33);
       } else {
-        if (next_nonsegwit_input == idx1 && idx2 > idx1 &&
+        if (info.next_legacy_input == idx1 && idx2 > idx1 &&
             (tx->inputs[0].script_type == InputScriptType_SPENDADDRESS ||
              tx->inputs[0].script_type == InputScriptType_SPENDMULTISIG)) {
-          next_nonsegwit_input = idx2;
+          info.next_legacy_input = idx2;
         }
         tx->inputs[0].script_sig.size = 0;
       }
@@ -2424,15 +3985,11 @@ void signing_txack(TransactionType *tx) {
         idx2++;
         send_req_4_input();
       } else {
-        uint8_t hash[32] = {0};
-        hasher_Final(&hasher_check, hash);
-        if (memcmp(hash, hash_inputs_check, 32) != 0) {
-          fsm_sendFailure(FailureType_Failure_DataError,
-                          _("Transaction has changed during signing"));
-          signing_abort();
+        if (!tx_info_check_inputs_hash(&info)) {
           return;
         }
-        hasher_Reset(&hasher_check);
+
+        hasher_Reset(&info.hasher_check);
         idx2 = 0;
         send_req_4_output();
       }
@@ -2441,18 +3998,13 @@ void signing_txack(TransactionType *tx) {
       if (!signing_validate_output(&tx->outputs[0])) {
         return;
       }
-      progress = 500 + ((signatures * progress_step +
-                         (info.inputs_count + idx2) * progress_meta_step) >>
-                        PROGRESS_PRECISION);
-      if (compile_output(coin, amount_unit, &root, tx->outputs, &bin_output,
-                         false) <= 0) {
-        fsm_sendFailure(FailureType_Failure_ProcessError,
-                        _("Failed to compile output"));
-        signing_abort();
+      progress_step++;
+
+      if (!compile_output(tx->outputs, &bin_output, false)) {
         return;
       }
       //  check hashOutputs
-      tx_output_hash(&hasher_check, &bin_output, coin->decred);
+      tx_output_hash(&info.hasher_check, &bin_output, coin->decred);
       if (!tx_serialize_output_hash(&ti, &bin_output)) {
         fsm_sendFailure(FailureType_Failure_ProcessError,
                         _("Failed to serialize output"));
@@ -2463,44 +4015,45 @@ void signing_txack(TransactionType *tx) {
         idx2++;
         send_req_4_output();
       } else {
-        if (!signing_sign_input()) {
+        if (!tx_info_check_outputs_hash(&info) ||
+            !signing_sign_legacy_input()) {
           return;
         }
-        // since this took a longer time, update progress
         signatures++;
-        progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
-        layoutProgress(_("Signing transaction"), progress);
-        update_ctr = 0;
-        if (idx1 < info.inputs_count - 1) {
-          idx1++;
-          phase2_request_next_input();
-        } else {
-          idx1 = 0;
-          send_req_5_output();
-        }
+        // since this took a longer time, update progress
+        report_progress(true);
+        phase2_request_next_input(false);
       }
       return;
 
-    case STAGE_REQUEST_SEGWIT_INPUT:
+    case STAGE_REQUEST_NONLEGACY_INPUT:
       if (!signing_validate_input(&tx->inputs[0])) {
         return;
       }
+      progress_step++;
+
+      if (is_external_input(idx1) !=
+          (tx->inputs[0].script_type == InputScriptType_EXTERNAL)) {
+        fsm_sendFailure(FailureType_Failure_DataError,
+                        _("Transaction has changed during signing"));
+        signing_abort();
+        return;
+      }
+
       resp.has_serialized = true;
       resp.serialized.has_signature_index = false;
       resp.serialized.has_signature = false;
-      resp.serialized.has_serialized_tx = true;
       if (tx->inputs[0].script_type == InputScriptType_SPENDMULTISIG ||
           tx->inputs[0].script_type == InputScriptType_SPENDADDRESS) {
-        if (!(coin->force_bip143 || coin->overwintered)) {
+        if (!(coin->force_bip143 || coin->overwintered) || taproot_only) {
           fsm_sendFailure(FailureType_Failure_DataError,
                           _("Transaction has changed during signing"));
           signing_abort();
           return;
         }
-        if (!compile_input_script_sig(&tx->inputs[0])) {
-          fsm_sendFailure(FailureType_Failure_ProcessError,
-                          _("Failed to compile input"));
-          signing_abort();
+        if (!tx_info_check_input(&info, &tx->inputs[0]) ||
+            !input_derive_node(&tx->inputs[0]) ||
+            !fill_input_script_sig(&tx->inputs[0])) {
           return;
         }
         if (!tx->inputs[0].has_amount) {
@@ -2513,34 +4066,37 @@ void signing_txack(TransactionType *tx) {
         uint8_t hash[32] = {0};
 #if !BITCOIN_ONLY
         if (coin->overwintered) {
-          if (info.version != 4) {
+          if (info.version == 4) {
+            signing_hash_zip243(&info, &tx->inputs[0], hash);
+          } else if (info.version == 5) {
+            if (!fill_input_script_pubkey(&tx->inputs[0])) {
+              return;
+            }
+            signing_hash_zip244(&info, &tx->inputs[0], hash);
+          } else {
             fsm_sendFailure(
                 FailureType_Failure_DataError,
                 _("Unsupported version for overwintered transaction"));
             signing_abort();
             return;
           }
-          signing_hash_zip243(&info, &tx->inputs[0], hash);
         } else
 #endif
         {
           signing_hash_bip143(&info, &tx->inputs[0], hash);
         }
-        if (!signing_sign_hash(&tx->inputs[0], node.private_key,
-                               node.public_key, hash))
+        if (!signing_sign_ecdsa(&tx->inputs[0], node.private_key,
+                                node.public_key, hash))
           return;
-        // since this took a longer time, update progress
         signatures++;
-        progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
-        layoutProgress(_("Signing transaction"), progress);
-        update_ctr = 0;
+        // since this took a longer time, update progress
+        report_progress(true);
       } else if (tx->inputs[0].script_type ==
                      InputScriptType_SPENDP2SHWITNESS &&
                  !tx->inputs[0].has_multisig) {
-        if (!compile_input_script_sig(&tx->inputs[0])) {
-          fsm_sendFailure(FailureType_Failure_ProcessError,
-                          _("Failed to compile input"));
-          signing_abort();
+        if (!tx_info_check_input(&info, &tx->inputs[0]) ||
+            !input_derive_node(&tx->inputs[0]) ||
+            !fill_input_script_sig(&tx->inputs[0])) {
           return;
         }
         // fixup normal p2pkh script into witness 0 p2wpkh script for p2sh
@@ -2568,46 +4124,36 @@ void signing_txack(TransactionType *tx) {
           signing_abort();
           return;
         }
+      } else if (tx->inputs[0].script_type == InputScriptType_EXTERNAL &&
+                 tx->inputs[0].has_script_sig) {
+        // use the provided script_sig
       } else {
         // direct witness scripts require zero scriptSig
         tx->inputs[0].script_sig.size = 0;
       }
-      resp.serialized.serialized_tx.size = tx_serialize_input(
-          &to, &tx->inputs[0], resp.serialized.serialized_tx.bytes);
-      if (idx1 < info.inputs_count - 1) {
-        idx1++;
-        phase2_request_next_input();
-      } else {
-        idx1 = 0;
-        send_req_5_output();
+      if (serialize) {
+        resp.has_serialized = true;
+        resp.serialized.has_serialized_tx = true;
+        resp.serialized.serialized_tx.size = tx_serialize_input(
+            &to, &tx->inputs[0], resp.serialized.serialized_tx.bytes);
       }
+      phase2_request_next_input(false);
       return;
 
     case STAGE_REQUEST_5_OUTPUT:
       if (!signing_validate_output(&tx->outputs[0])) {
         return;
       }
-      if (compile_output(coin, amount_unit, &root, tx->outputs, &bin_output,
-                         false) <= 0) {
-        fsm_sendFailure(FailureType_Failure_ProcessError,
-                        _("Failed to compile output"));
-        signing_abort();
+      progress_step++;
+
+      if (!compile_output(tx->outputs, &bin_output, false)) {
         return;
       }
       resp.has_serialized = true;
       resp.serialized.has_serialized_tx = true;
       resp.serialized.serialized_tx.size = tx_serialize_output(
           &to, &bin_output, resp.serialized.serialized_tx.bytes);
-      if (idx1 < info.outputs_count - 1) {
-        idx1++;
-        send_req_5_output();
-      } else if (to.is_segwit) {
-        idx1 = 0;
-        send_req_segwit_witness();
-      } else {
-        send_req_finished();
-        signing_abort();
-      }
+      phase2_request_next_output(false);
       return;
 
     case STAGE_REQUEST_SEGWIT_WITNESS:
@@ -2618,16 +4164,9 @@ void signing_txack(TransactionType *tx) {
         return;
       }
       signatures++;
-      progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
-      layoutProgress(_("Signing transaction"), progress);
-      update_ctr = 0;
-      if (idx1 < info.inputs_count - 1) {
-        idx1++;
-        send_req_segwit_witness();
-      } else {
-        send_req_finished();
-        signing_abort();
-      }
+      progress_step++;
+      report_progress(true);
+      phase2_request_next_witness(false);
       return;
 
 #if !BITCOIN_ONLY
@@ -2636,27 +4175,25 @@ void signing_txack(TransactionType *tx) {
       if (!signing_validate_input(&tx->inputs[0])) {
         return;
       }
-      progress =
-          500 + ((signatures * progress_step + idx2 * progress_meta_step) >>
-                 PROGRESS_PRECISION);
       if (idx1 == 0) {
         // witness
         tx_init(&to, info.inputs_count, info.outputs_count, info.version,
-                info.lock_time, info.expiry, 0, coin->curve->hasher_sign,
-                coin->overwintered, info.version_group_id, info.timestamp);
+                info.lock_time, info.expiry, tx->branch_id, 0,
+                coin->curve->hasher_sign, coin->overwintered,
+                info.version_group_id, info.timestamp);
         to.is_decred = true;
       }
 
       // witness hash
       tx_init(&ti, info.inputs_count, info.outputs_count, info.version,
-              info.lock_time, info.expiry, 0, coin->curve->hasher_sign,
-              coin->overwintered, info.version_group_id, info.timestamp);
+              info.lock_time, info.expiry, tx->branch_id, 0,
+              coin->curve->hasher_sign, coin->overwintered,
+              info.version_group_id, info.timestamp);
       ti.version |= (DECRED_SERIALIZE_WITNESS_SIGNING << 16);
       ti.is_decred = true;
-      if (!compile_input_script_sig(&tx->inputs[0])) {
-        fsm_sendFailure(FailureType_Failure_ProcessError,
-                        _("Failed to compile input"));
-        signing_abort();
+      if (!tx_info_check_input(&info, &tx->inputs[0]) ||
+          !input_derive_node(&tx->inputs[0]) ||
+          !fill_input_script_sig(&tx->inputs[0])) {
         return;
       }
 
@@ -2679,11 +4216,10 @@ void signing_txack(TransactionType *tx) {
       if (!signing_sign_decred_input(&tx->inputs[0])) {
         return;
       }
-      // since this took a longer time, update progress
       signatures++;
-      progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
-      layoutProgress(_("Signing transaction"), progress);
-      update_ctr = 0;
+      progress_step++;
+      // since this took a longer time, update progress
+      report_progress(true);
       if (idx1 < info.inputs_count - 1) {
         idx1++;
         send_req_decred_witness();
@@ -2707,4 +4243,8 @@ void signing_abort(void) {
   }
   memzero(&root, sizeof(root));
   memzero(&node, sizeof(node));
+}
+
+bool signing_is_preauthorized(void) {
+  return signing && (is_coinjoin == sectrue);
 }

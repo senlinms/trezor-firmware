@@ -2,9 +2,11 @@
 #![allow(non_upper_case_globals)]
 #![allow(dead_code)]
 
-use core::convert::TryFrom;
+use core::{convert::TryFrom, slice, str::from_utf8};
 
-use crate::{error::Error, micropython::obj::Obj};
+use crate::error::Error;
+
+use super::{ffi, obj::Obj};
 
 impl Qstr {
     pub const fn to_obj(self) -> Obj {
@@ -30,6 +32,19 @@ impl Qstr {
         // TODO: Change the internal representation of Qstr to u16.
         Self(val as _)
     }
+
+    pub fn as_str(self) -> &'static str {
+        let mut len = 0usize;
+        let slice = unsafe {
+            // SAFETY: qstr_data should always return a valid string, even for unknown ids.
+            let ptr = ffi::qstr_data(self.0 as _, &mut len as *mut _);
+            slice::from_raw_parts(ptr, len)
+        };
+        // SAFETY: Qstr pools are either ROM-based or permanently allocated in the GC
+        // arena. The MicroPython runtime holds the respective head pointers so we don't
+        // need to care.
+        unwrap!(from_utf8(slice))
+    }
 }
 
 impl From<u16> for Qstr {
@@ -45,7 +60,7 @@ impl TryFrom<Obj> for Qstr {
         if value.is_qstr() {
             Ok(Self::from_obj_bits(value.as_bits()))
         } else {
-            Err(Error::InvalidType)
+            Err(Error::TypeError)
         }
     }
 }

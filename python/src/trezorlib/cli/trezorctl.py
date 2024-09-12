@@ -2,7 +2,7 @@
 
 # This file is part of the Trezor project.
 #
-# Copyright (C) 2012-2019 SatoshiLabs and contributors
+# Copyright (C) 2012-2022 SatoshiLabs and contributors
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3
@@ -20,14 +20,16 @@ import json
 import logging
 import os
 import time
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, TypeVar, cast
 
 import click
 
-from .. import log, messages, protobuf, ui
+from .. import __version__, log, messages, protobuf, ui
 from ..client import TrezorClient
-from ..transport import enumerate_devices
+from ..transport import DeviceIsBusy, enumerate_devices
 from ..transport.udp import UdpTransport
 from . import (
+    AliasedGroup,
     TrezorConnection,
     binance,
     btc,
@@ -40,7 +42,6 @@ from . import (
     ethereum,
     fido,
     firmware,
-    lisk,
     monero,
     nem,
     ripple,
@@ -50,12 +51,17 @@ from . import (
     with_client,
 )
 
+F = TypeVar("F", bound=Callable)
+
+if TYPE_CHECKING:
+    from ..transport import Transport
+
 LOG = logging.getLogger(__name__)
 
 COMMAND_ALIASES = {
     "change-pin": settings.pin,
-    "enable-passphrase": settings.passphrase_enable,
-    "disable-passphrase": settings.passphrase_disable,
+    "enable-passphrase": settings.passphrase_on,
+    "disable-passphrase": settings.passphrase_off,
     "wipe-device": device.wipe,
     "reset-device": device.setup,
     "recovery-device": device.recover,
@@ -70,27 +76,21 @@ COMMAND_ALIASES = {
     "bnb": binance.cli,
     "eth": ethereum.cli,
     "ada": cardano.cli,
-    "lsk": lisk.cli,
     "xmr": monero.cli,
     "xrp": ripple.cli,
     "xlm": stellar.cli,
     "xtz": tezos.cli,
-    # firmware-update aliases:
-    "update-firmware": firmware.firmware_update,
-    "upgrade-firmware": firmware.firmware_update,
-    "firmware-upgrade": firmware.firmware_update,
+    # firmware aliases:
+    "fw": firmware.cli,
+    "update-firmware": firmware.update,
+    "upgrade-firmware": firmware.update,
+    "firmware-upgrade": firmware.update,
+    "firmware-update": firmware.update,
 }
 
 
-class TrezorctlGroup(click.Group):
+class TrezorctlGroup(AliasedGroup):
     """Command group that handles compatibility for trezorctl.
-
-    The purpose is twofold: convert underscores to dashes, and ensure old-style commands
-    still work with new-style groups.
-
-    Click 7.0 silently switched all underscore_commands to dash-commands.
-    This implementation of `click.Group` responds to underscore_commands by invoking
-    the respective dash-command.
 
     With trezorctl 0.11.5, we started to convert old-style long commands
     (such as "binance-sign-tx") to command groups ("binance") with subcommands
@@ -99,17 +99,13 @@ class TrezorctlGroup(click.Group):
     subcommand of "binance" group.
     """
 
-    def get_command(self, ctx, cmd_name):
-        cmd_name = cmd_name.replace("_", "-")
-        # try to look up the real name
+    def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
         cmd = super().get_command(ctx, cmd_name)
         if cmd:
             return cmd
 
-        # look for a backwards compatibility alias
-        if cmd_name in COMMAND_ALIASES:
-            return COMMAND_ALIASES[cmd_name]
-
+        # the subsequent lookups rely on dash-separated command names
+        cmd_name = cmd_name.replace("_", "-")
         # look for subcommand in btc - "sign-tx" is now "btc sign-tx"
         cmd = btc.cli.get_command(ctx, cmd_name)
         if cmd:
@@ -119,20 +115,48 @@ class TrezorctlGroup(click.Group):
         # We are moving to 'binance' command with 'sign-tx' subcommand.
         try:
             command, subcommand = cmd_name.split("-", maxsplit=1)
-            return super().get_command(ctx, command).get_command(ctx, subcommand)
+            # get_command can return None and the following line will fail.
+            # We don't care, we ignore the exception anyway.
+            return super().get_command(ctx, command).get_command(ctx, subcommand)  # type: ignore ["get_command" is not a known member of "None";;Cannot access member "get_command" for type "Command"]
         except Exception:
             pass
 
         return None
 
+    def set_result_callback(self) -> Callable[[F], F]:
+        """Set a function called to format the return value of a command.
 
-def configure_logging(verbose: int):
+        Compatibility wrapper for Click 7.x `resultcallback` and >=8.1 `result_callback`
+        """
+        # Click 7.x uses `resultcallback` to configure the callback, and
+        #   `result_callback` to store its value.
+        # Click 8.x uses `result_callback` to configure the callback, and
+        #   `_result_callback` to store its value.
+        # Click 8.0 has a `resultcallback` function that emits a warning and delegates
+        #   to `result_callback`. Click 8.1 removes this function.
+        #
+        # This means that there is no reasonable way to use `hasattr` to detect where we
+        # are, unless we want to look at the private `_result_callback` attribute.
+        # Instead, we look at Click version and hope for the best.
+        from click import __version__ as click_version
+
+        if click_version.startswith("7."):
+            return super().resultcallback()  # type: ignore [Cannot access member]
+        else:
+            return super().result_callback()
+
+
+def configure_logging(verbose: int) -> None:
     if verbose:
         log.enable_debug_output(verbose)
         log.OMITTED_MESSAGES.add(messages.Features)
 
 
-@click.command(cls=TrezorctlGroup, context_settings={"max_content_width": 400})
+@click.command(
+    cls=TrezorctlGroup,
+    context_settings={"max_content_width": 400},
+    aliases=COMMAND_ALIASES,
+)
 @click.option(
     "-p",
     "--path",
@@ -150,31 +174,64 @@ def configure_logging(verbose: int):
     help="Enter passphrase on host.",
 )
 @click.option(
+    "-S",
+    "--script",
+    is_flag=True,
+    help="Use UI for usage in scripts.",
+)
+@click.option(
     "-s",
     "--session-id",
     metavar="HEX",
     help="Resume given session ID.",
     default=os.environ.get("TREZOR_SESSION_ID"),
 )
-@click.version_option()
+@click.option(
+    "-r",
+    "--record",
+    help="Record screen changes into a specified directory.",
+)
+@click.version_option(version=__version__)
 @click.pass_context
-def cli(ctx, path, verbose, is_json, passphrase_on_host, session_id):
+def cli_main(
+    ctx: click.Context,
+    path: str,
+    verbose: int,
+    is_json: bool,
+    passphrase_on_host: bool,
+    script: bool,
+    session_id: Optional[str],
+    record: Optional[str],
+) -> None:
     configure_logging(verbose)
 
+    bytes_session_id: Optional[bytes] = None
     if session_id is not None:
         try:
-            session_id = bytes.fromhex(session_id)
+            bytes_session_id = bytes.fromhex(session_id)
         except ValueError:
-            raise click.ClickException("Not a valid session id: {}".format(session_id))
+            raise click.ClickException(f"Not a valid session id: {session_id}")
 
-    ctx.obj = TrezorConnection(path, session_id, passphrase_on_host)
+    ctx.obj = TrezorConnection(path, bytes_session_id, passphrase_on_host, script)
+
+    # Optionally record the screen into a specified directory.
+    if record:
+        debug.record_screen_from_connection(ctx.obj, record)
 
 
-@cli.resultcallback()
-def print_result(res, is_json, **kwargs):
+# Creating a cli function that has the right types for future usage
+cli = cast(TrezorctlGroup, cli_main)
+
+
+@cli.set_result_callback()
+def print_result(res: Any, is_json: bool, script: bool, **kwargs: Any) -> None:
     if is_json:
         if isinstance(res, protobuf.MessageType):
-            click.echo(json.dumps({res.__class__.__name__: res.__dict__}))
+            res = protobuf.to_dict(res, hexlify_bytes=True)
+
+        # No newlines for scripts, pretty-print for users
+        if script:
+            click.echo(json.dumps(res))
         else:
             click.echo(json.dumps(res, sort_keys=True, indent=4))
     else:
@@ -185,22 +242,35 @@ def print_result(res, is_json, **kwargs):
             for k, v in res.items():
                 if isinstance(v, dict):
                     for kk, vv in v.items():
-                        click.echo("%s.%s: %s" % (k, kk, vv))
+                        click.echo(f"{k}.{kk}: {vv}")
                 else:
-                    click.echo("%s: %s" % (k, v))
+                    click.echo(f"{k}: {v}")
         elif isinstance(res, protobuf.MessageType):
             click.echo(protobuf.format_message(res))
         elif res is not None:
             click.echo(res)
 
 
-def format_device_name(features):
+@cli.set_result_callback()
+@click.pass_obj
+def stop_recording_action(obj: TrezorConnection, *args: Any, **kwargs: Any) -> None:
+    """Stop recording screen changes when the recording was started by `cli_main`.
+
+    (When user used the `-r / --record` option of `trezorctl` command.)
+
+    It allows for isolating screen directories only for specific actions/commands.
+    """
+    if kwargs.get("record"):
+        debug.record_screen_from_connection(obj, None)
+
+
+def format_device_name(features: messages.Features) -> str:
     model = features.model or "1"
     if features.bootloader_mode:
-        return "Trezor {} bootloader".format(model)
+        return f"Trezor {model} bootloader"
 
     label = features.label or "(unnamed)"
-    return "{} [Trezor {}, {}]".format(label, model, features.device_id)
+    return f"{label} [Trezor {model}, {features.device_id}]"
 
 
 #
@@ -210,23 +280,28 @@ def format_device_name(features):
 
 @cli.command(name="list")
 @click.option("-n", "no_resolve", is_flag=True, help="Do not resolve Trezor names")
-def list_devices(no_resolve):
+def list_devices(no_resolve: bool) -> Optional[Iterable["Transport"]]:
     """List connected Trezor devices."""
     if no_resolve:
         return enumerate_devices()
 
     for transport in enumerate_devices():
-        client = TrezorClient(transport, ui=ui.ClickUI())
-        click.echo("{} - {}".format(transport, format_device_name(client.features)))
-        client.end_session()
+        try:
+            client = TrezorClient(transport, ui=ui.ClickUI())
+            description = format_device_name(client.features)
+            client.end_session()
+        except DeviceIsBusy:
+            description = "Device is in use by another process"
+        except Exception:
+            description = "Failed to read details"
+        click.echo(f"{transport} - {description}")
+    return None
 
 
 @cli.command()
-def version():
+def version() -> str:
     """Show version of trezorctl/trezorlib."""
-    from .. import __version__ as VERSION
-
-    return VERSION
+    return __version__
 
 
 #
@@ -238,14 +313,14 @@ def version():
 @click.argument("message")
 @click.option("-b", "--button-protection", is_flag=True)
 @with_client
-def ping(client, message, button_protection):
+def ping(client: "TrezorClient", message: str, button_protection: bool) -> str:
     """Send ping message."""
     return client.ping(message, button_protection=button_protection)
 
 
 @cli.command()
 @click.pass_obj
-def get_session(obj):
+def get_session(obj: TrezorConnection) -> str:
     """Get a session ID for subsequent commands.
 
     Unlocks Trezor with a passphrase and returns a session ID. Use this session ID with
@@ -273,20 +348,20 @@ def get_session(obj):
 
 @cli.command()
 @with_client
-def clear_session(client):
+def clear_session(client: "TrezorClient") -> None:
     """Clear session (remove cached PIN, passphrase, etc.)."""
     return client.clear_session()
 
 
 @cli.command()
 @with_client
-def get_features(client):
+def get_features(client: "TrezorClient") -> messages.Features:
     """Retrieve device features and settings."""
     return client.features
 
 
 @cli.command()
-def usb_reset():
+def usb_reset() -> None:
     """Perform USB reset on stuck devices.
 
     This can fix LIBUSB_ERROR_PIPE and similar errors when connecting to a device
@@ -300,7 +375,7 @@ def usb_reset():
 @cli.command()
 @click.option("-t", "--timeout", type=float, default=10, help="Timeout in seconds")
 @click.pass_obj
-def wait_for_emulator(obj, timeout):
+def wait_for_emulator(obj: TrezorConnection, timeout: float) -> None:
     """Wait until Trezor Emulator comes up.
 
     Tries to connect to emulator and returns when it succeeds.
@@ -308,14 +383,14 @@ def wait_for_emulator(obj, timeout):
     path = obj.path
     if path:
         if not path.startswith("udp:"):
-            raise click.ClickException("You must use UDP path, not {}".format(path))
+            raise click.ClickException(f"You must use UDP path, not {path}")
         path = path.replace("udp:", "")
 
     start = time.monotonic()
     UdpTransport(path).wait_until_ready(timeout)
     end = time.monotonic()
 
-    LOG.info("Waited for {:.3f} seconds".format(end - start))
+    LOG.info(f"Waited for {end - start:.3f} seconds")
 
 
 #
@@ -331,7 +406,6 @@ cli.add_command(device.cli)
 cli.add_command(eos.cli)
 cli.add_command(ethereum.cli)
 cli.add_command(fido.cli)
-cli.add_command(lisk.cli)
 cli.add_command(monero.cli)
 cli.add_command(nem.cli)
 cli.add_command(ripple.cli)
@@ -339,7 +413,7 @@ cli.add_command(settings.cli)
 cli.add_command(stellar.cli)
 cli.add_command(tezos.cli)
 
-cli.add_command(firmware.firmware_update)
+cli.add_command(firmware.cli)
 cli.add_command(debug.cli)
 
 #

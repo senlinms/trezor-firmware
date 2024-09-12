@@ -1,8 +1,9 @@
 from micropython import const
+from typing import TYPE_CHECKING
 
-from apps.common import HARDENED, paths
+if TYPE_CHECKING:
+    from apps.common import paths
 
-from . import SLIP44_ID
 
 NEM_NETWORK_MAINNET = const(0x68)
 NEM_NETWORK_TESTNET = const(0x98)
@@ -39,13 +40,19 @@ def get_network_str(network: int) -> str:
     elif network == NEM_NETWORK_MIJIN:
         return "Mijin"
 
+    raise ValueError  # no valid network
+
 
 def check_path(path: paths.Bip32Path, network: int) -> bool:
     """Validates that the appropriate coin_type is set for the given network."""
+    from apps.common import paths
+
+    from . import SLIP44_ID
+
     if len(path) < 2:
         return False
 
-    coin_type = path[1] - HARDENED
+    coin_type = path[1] - paths.HARDENED
 
     if network == NEM_NETWORK_TESTNET:
         return coin_type == 1

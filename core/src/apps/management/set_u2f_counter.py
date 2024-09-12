@@ -1,24 +1,30 @@
-import storage.device
-from trezor import ui, wire
-from trezor.messages import ButtonRequestType
-from trezor.messages.SetU2FCounter import SetU2FCounter
-from trezor.messages.Success import Success
-from trezor.ui.components.tt.text import Text
+from typing import TYPE_CHECKING
 
-from apps.common.confirm import require_confirm
+if TYPE_CHECKING:
+    from trezor.messages import SetU2FCounter, Success
 
 
-async def set_u2f_counter(ctx: wire.Context, msg: SetU2FCounter) -> Success:
-    if not storage.device.is_initialized():
+async def set_u2f_counter(msg: SetU2FCounter) -> Success:
+    import storage.device as storage_device
+    from trezor import wire
+    from trezor.enums import ButtonRequestType
+    from trezor.messages import Success
+    from trezor.ui.layouts import confirm_action
+
+    if not storage_device.is_initialized():
         raise wire.NotInitialized("Device is not initialized")
     if msg.u2f_counter is None:
         raise wire.ProcessError("No value provided")
 
-    text = Text("Set U2F counter", ui.ICON_CONFIG)
-    text.normal("Do you really want to", "set the U2F counter")
-    text.bold("to %d?" % msg.u2f_counter)
-    await require_confirm(ctx, text, code=ButtonRequestType.ProtectCall)
+    await confirm_action(
+        "set_u2f_counter",
+        "Set U2F counter",
+        description="Set the U2F counter to {}?",
+        description_param=str(msg.u2f_counter),
+        verb="SET",
+        br_code=ButtonRequestType.ProtectCall,
+    )
 
-    storage.device.set_u2f_counter(msg.u2f_counter)
+    storage_device.set_u2f_counter(msg.u2f_counter)
 
     return Success(message="U2F counter set")

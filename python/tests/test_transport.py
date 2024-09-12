@@ -1,6 +1,6 @@
 # This file is part of the Trezor project.
 #
-# Copyright (C) 2012-2019 SatoshiLabs and contributors
+# Copyright (C) 2012-2022 SatoshiLabs and contributors
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3
@@ -34,8 +34,8 @@ def test_disabled_transport():
 def test_import_all_transports():
     from trezorlib.transport.bridge import BridgeTransport
     from trezorlib.transport.hid import HidTransport
-    from trezorlib.transport.webusb import WebUsbTransport
     from trezorlib.transport.udp import UdpTransport
+    from trezorlib.transport.webusb import WebUsbTransport
 
     assert BridgeTransport
     assert HidTransport

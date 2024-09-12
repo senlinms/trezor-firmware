@@ -23,6 +23,7 @@
   "cashaddr_prefix": null,
   "slip44": 1,
   "segwit": true,
+  "taproot": false,
   "decred": false,
   "fork_id": null,
   "force_bip143": false,
@@ -36,7 +37,7 @@
   "max_address_length": 34,
   "negative_fee": false,
   "cooldown": 100,
-  "consensus_branch_id": null,
+  "overwintered": false,
   "extra_data": false,
   "timestamp": true,
   "confidential_assets": null

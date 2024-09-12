@@ -2,15 +2,37 @@
 
 base_branch=master
 fail=0
-subdirs="core python legacy/firmware legacy/bootloader"
+subdirs="core core/embed/boardloader core/embed/bootloader core/embed/bootloader_ci legacy/bootloader legacy/firmware legacy/intermediate_fw python"
+
+# $ignored_files is a newline-separated list of patterns for grep
+# therefore there must not be empty lines at start or end
+ignored_files="^core/src/apps/ethereum/networks.py$
+^core/src/apps/ethereum/tokens.py$
+^core/src/trezor/enums/.*
+^core/src/trezor/messages.py$
+^python/src/trezorlib/messages.py$"
+
+changed_files=$(mktemp)
+trap 'rm -- $changed_files' EXIT
 
 git fetch origin "$base_branch"
 
 check_feature_branch () {
+
+    for commit in $(git rev-list origin/$base_branch..)
+    do
+        if git log -n1 --format=%B "$commit" | grep -iFq "[no changelog]"; then
+            echo "Found [no changelog] in $commit, skipping."
+            continue
+        fi
+
+        git show --pretty=format: --name-only "$commit" | grep -v "$ignored_files" >> "$changed_files"
+    done
+
     for subdir in $subdirs
     do
         echo "Checking $subdir"
-        files=$(git diff --name-only "origin/$base_branch..." -- "$subdir")
+        files=$(grep "^$subdir/" "$changed_files")
 
         if echo "$files" | grep . | grep -Fq -v .changelog.d; then
             if ! echo "$files" | grep -Fq .changelog.d; then
@@ -29,7 +51,7 @@ check_release_branch () {
     fi
 }
 
-if echo "$CI_COMMIT_BRANCH" | grep -q "^release/"; then
+if echo "$CI_COMMIT_BRANCH" | grep -Eq "^(release|secfix)/"; then
     check_release_branch
 else
     check_feature_branch

@@ -18,6 +18,19 @@
  */
 
 bool get_features(Features *resp) {
+  resp->has_fw_vendor = true;
+#if EMULATOR
+  strlcpy(resp->fw_vendor, "EMULATOR", sizeof(resp->fw_vendor));
+#else
+  const image_header *hdr =
+      (const image_header *)FLASH_PTR(FLASH_FWHEADER_START);
+  // allow both v2 and v3 signatures
+  if (SIG_OK == signatures_match(hdr, NULL)) {
+    strlcpy(resp->fw_vendor, "SatoshiLabs", sizeof(resp->fw_vendor));
+  } else {
+    strlcpy(resp->fw_vendor, "UNSAFE, DO NOT USE!", sizeof(resp->fw_vendor));
+  }
+#endif
   resp->has_vendor = true;
   strlcpy(resp->vendor, "trezor.io", sizeof(resp->vendor));
   resp->major_version = VERSION_MAJOR;
@@ -56,6 +69,10 @@ bool get_features(Features *resp) {
   resp->has_flags = config_getFlags(&(resp->flags));
   resp->has_model = true;
   strlcpy(resp->model, "1", sizeof(resp->model));
+  resp->has_safety_checks = true;
+  resp->safety_checks = config_getSafetyCheckLevel();
+  resp->has_busy = true;
+  resp->busy = (system_millis_busy_deadline > timer_ms());
   if (session_isUnlocked()) {
     resp->has_wipe_code_protection = true;
     resp->wipe_code_protection = config_hasWipeCode();
@@ -68,22 +85,20 @@ bool get_features(Features *resp) {
   resp->capabilities[0] = Capability_Capability_Bitcoin;
   resp->capabilities[1] = Capability_Capability_Crypto;
 #else
-  resp->capabilities_count = 8;
+  resp->capabilities_count = 7;
   resp->capabilities[0] = Capability_Capability_Bitcoin;
   resp->capabilities[1] = Capability_Capability_Bitcoin_like;
   resp->capabilities[2] = Capability_Capability_Crypto;
   resp->capabilities[3] = Capability_Capability_Ethereum;
-  resp->capabilities[4] = Capability_Capability_Lisk;
-  resp->capabilities[5] = Capability_Capability_NEM;
-  resp->capabilities[6] = Capability_Capability_Stellar;
-  resp->capabilities[7] = Capability_Capability_U2F;
+  resp->capabilities[4] = Capability_Capability_NEM;
+  resp->capabilities[5] = Capability_Capability_Stellar;
+  resp->capabilities[6] = Capability_Capability_U2F;
 #endif
   return resp;
 }
 
 void fsm_msgInitialize(const Initialize *msg) {
-  recovery_abort();
-  signing_abort();
+  fsm_abortWorkflows();
 
   uint8_t *session_id;
   if (msg && msg->has_session_id) {
@@ -238,6 +253,8 @@ void fsm_msgWipeDevice(const WipeDevice *msg) {
 }
 
 void fsm_msgGetEntropy(const GetEntropy *msg) {
+  CHECK_PIN
+
 #if !DEBUG_RNG
   layoutDialogSwipe(&bmp_icon_question, _("Cancel"), _("Confirm"), NULL,
                     _("Do you really want to"), _("send entropy?"), NULL, NULL,
@@ -313,11 +330,7 @@ void fsm_msgResetDevice(const ResetDevice *msg) {
 }
 
 void fsm_msgEntropyAck(const EntropyAck *msg) {
-  if (msg->has_entropy) {
-    reset_entropy(msg->entropy.bytes, msg->entropy.size);
-  } else {
-    reset_entropy(0, 0);
-  }
+  reset_entropy(msg->entropy.bytes, msg->entropy.size);
 }
 
 void fsm_msgBackupDevice(const BackupDevice *msg) {
@@ -336,11 +349,7 @@ void fsm_msgBackupDevice(const BackupDevice *msg) {
 
 void fsm_msgCancel(const Cancel *msg) {
   (void)msg;
-  recovery_abort();
-  signing_abort();
-#if !BITCOIN_ONLY
-  ethereum_signing_abort();
-#endif
+  fsm_abortWorkflows();
   fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
 }
 
@@ -363,7 +372,8 @@ void fsm_msgApplySettings(const ApplySettings *msg) {
       _("This firmware is incapable of passphrase entry on the device."));
 
   CHECK_PARAM(msg->has_label || msg->has_language || msg->has_use_passphrase ||
-                  msg->has_homescreen || msg->has_auto_lock_delay_ms,
+                  msg->has_homescreen || msg->has_auto_lock_delay_ms ||
+                  msg->has_safety_checks,
               _("No setting provided"));
 
   CHECK_PIN
@@ -432,6 +442,23 @@ void fsm_msgApplySettings(const ApplySettings *msg) {
     }
   }
 
+  if (msg->has_safety_checks) {
+    if (msg->safety_checks == SafetyCheckLevel_Strict ||
+        msg->safety_checks == SafetyCheckLevel_PromptTemporarily) {
+      layoutConfirmSafetyChecks(msg->safety_checks);
+      if (!protectButton(ButtonRequestType_ButtonRequest_ProtectCall, false)) {
+        fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
+        layoutHome();
+        return;
+      }
+    } else {
+      fsm_sendFailure(FailureType_Failure_ProcessError,
+                      _("Unsupported safety-checks setting"));
+      layoutHome();
+      return;
+    }
+  }
+
   if (msg->has_label) {
     config_setLabel(msg->label);
   }
@@ -447,6 +474,9 @@ void fsm_msgApplySettings(const ApplySettings *msg) {
   if (msg->has_auto_lock_delay_ms) {
     config_setAutoLockDelayMs(msg->auto_lock_delay_ms);
   }
+  if (msg->has_safety_checks) {
+    config_setSafetyCheckLevel(msg->safety_checks);
+  }
   fsm_sendSuccess(_("Settings applied"));
   layoutHome();
 }
@@ -454,9 +484,7 @@ void fsm_msgApplySettings(const ApplySettings *msg) {
 void fsm_msgApplyFlags(const ApplyFlags *msg) {
   CHECK_PIN
 
-  if (msg->has_flags) {
-    config_applyFlags(msg->flags);
-  }
+  config_applyFlags(msg->flags);
   fsm_sendSuccess(_("Flags applied"));
 }
 
@@ -488,9 +516,15 @@ void fsm_msgRecoveryDevice(const RecoveryDevice *msg) {
                 msg->has_u2f_counter ? msg->u2f_counter : 0, dry_run);
 }
 
-void fsm_msgWordAck(const WordAck *msg) { recovery_word(msg->word); }
+void fsm_msgWordAck(const WordAck *msg) {
+  CHECK_UNLOCKED
+
+  recovery_word(msg->word);
+}
 
 void fsm_msgSetU2FCounter(const SetU2FCounter *msg) {
+  CHECK_PIN
+
   layoutDialogSwipe(&bmp_icon_question, _("Cancel"), _("Confirm"), NULL,
                     _("Do you want to set"), _("the U2F counter?"), NULL, NULL,
                     NULL, NULL);
@@ -505,6 +539,8 @@ void fsm_msgSetU2FCounter(const SetU2FCounter *msg) {
 }
 
 void fsm_msgGetNextU2FCounter() {
+  CHECK_PIN
+
   layoutDialogSwipe(&bmp_icon_question, _("Cancel"), _("Confirm"), NULL,
                     _("Do you want to"), _("increase and retrieve"),
                     _("the U2F counter?"), NULL, NULL, NULL);
@@ -516,8 +552,36 @@ void fsm_msgGetNextU2FCounter() {
   uint32_t counter = config_nextU2FCounter();
 
   RESP_INIT(NextU2FCounter);
-  resp->has_u2f_counter = true;
   resp->u2f_counter = counter;
   msg_write(MessageType_MessageType_NextU2FCounter, resp);
   layoutHome();
+}
+
+static void progress_callback(uint32_t iter, uint32_t total) {
+  layoutProgress(_("Please wait"), 1000 * iter / total);
+}
+
+void fsm_msgGetFirmwareHash(const GetFirmwareHash *msg) {
+  RESP_INIT(FirmwareHash);
+  layoutProgressSwipe(_("Please wait"), 0);
+  if (memory_firmware_hash(msg->challenge.bytes, msg->challenge.size,
+                           progress_callback, resp->hash.bytes) != 0) {
+    fsm_sendFailure(FailureType_Failure_FirmwareError, NULL);
+    return;
+  }
+
+  resp->hash.size = sizeof(resp->hash.bytes);
+  msg_write(MessageType_MessageType_FirmwareHash, resp);
+  layoutHome();
+}
+
+void fsm_msgSetBusy(const SetBusy *msg) {
+  if (msg->has_expiry_ms) {
+    system_millis_busy_deadline = timer_ms() + msg->expiry_ms;
+  } else {
+    system_millis_busy_deadline = 0;
+  }
+  fsm_sendSuccess(NULL);
+  layoutHome();
+  return;
 }

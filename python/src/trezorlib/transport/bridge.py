@@ -1,6 +1,6 @@
 # This file is part of the Trezor project.
 #
-# Copyright (C) 2012-2019 SatoshiLabs and contributors
+# Copyright (C) 2012-2022 SatoshiLabs and contributors
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3
@@ -16,12 +16,15 @@
 
 import logging
 import struct
-from typing import Any, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
 
 import requests
 
 from ..log import DUMP_PACKETS
-from . import MessagePayload, Transport, TransportException
+from . import DeviceIsBusy, MessagePayload, Transport, TransportException
+
+if TYPE_CHECKING:
+    from ..models import TrezorModel
 
 LOG = logging.getLogger(__name__)
 
@@ -34,14 +37,19 @@ CONNECTION = requests.Session()
 CONNECTION.headers.update(TREZORD_ORIGIN_HEADER)
 
 
-def call_bridge(uri: str, data=None) -> requests.Response:
-    url = TREZORD_HOST + "/" + uri
+class BridgeException(TransportException):
+    def __init__(self, path: str, status: int, message: str) -> None:
+        self.path = path
+        self.status = status
+        self.message = message
+        super().__init__(f"trezord: {path} failed with code {status}: {message}")
+
+
+def call_bridge(path: str, data: Optional[str] = None) -> requests.Response:
+    url = TREZORD_HOST + "/" + path
     r = CONNECTION.post(url, data=data)
     if r.status_code != 200:
-        error_str = "trezord: {} failed with code {}: {}".format(
-            uri, r.status_code, r.json()["error"]
-        )
-        raise TransportException(error_str)
+        raise BridgeException(path, r.status_code, r.json()["error"])
     return r
 
 
@@ -64,12 +72,12 @@ class BridgeHandle:
 
 class BridgeHandleModern(BridgeHandle):
     def write_buf(self, buf: bytes) -> None:
-        LOG.log(DUMP_PACKETS, "sending message: {}".format(buf.hex()))
+        LOG.log(DUMP_PACKETS, f"sending message: {buf.hex()}")
         self.transport._call("post", data=buf.hex())
 
     def read_buf(self) -> bytes:
         data = self.transport._call("read")
-        LOG.log(DUMP_PACKETS, "received message: {}".format(data.text))
+        LOG.log(DUMP_PACKETS, f"received message: {data.text}")
         return bytes.fromhex(data.text)
 
 
@@ -87,9 +95,9 @@ class BridgeHandleLegacy(BridgeHandle):
         if self.request is None:
             raise TransportException("Can't read without write on legacy Bridge")
         try:
-            LOG.log(DUMP_PACKETS, "calling with message: {}".format(self.request))
+            LOG.log(DUMP_PACKETS, f"calling with message: {self.request}")
             data = self.transport._call("call", data=self.request)
-            LOG.log(DUMP_PACKETS, "received response: {}".format(data.text))
+            LOG.log(DUMP_PACKETS, f"received response: {data.text}")
             return bytes.fromhex(data.text)
         finally:
             self.request = None
@@ -101,7 +109,7 @@ class BridgeTransport(Transport):
     """
 
     PATH_PREFIX = "bridge"
-    ENABLED = True
+    ENABLED: bool = True
 
     def __init__(
         self, device: Dict[str, Any], legacy: bool, debug: bool = False
@@ -120,14 +128,14 @@ class BridgeTransport(Transport):
             self.handle = BridgeHandleModern(self)
 
     def get_path(self) -> str:
-        return "%s:%s" % (self.PATH_PREFIX, self.device["path"])
+        return f"{self.PATH_PREFIX}:{self.device['path']}"
 
     def find_debug(self) -> "BridgeTransport":
         if not self.device.get("debug"):
             raise TransportException("Debug device not available")
         return BridgeTransport(self.device, self.legacy, debug=True)
 
-    def _call(self, action: str, data: str = None) -> requests.Response:
+    def _call(self, action: str, data: Optional[str] = None) -> requests.Response:
         session = self.session or "null"
         uri = action + "/" + str(session)
         if self.debug:
@@ -135,7 +143,9 @@ class BridgeTransport(Transport):
         return call_bridge(uri, data=data)
 
     @classmethod
-    def enumerate(cls) -> Iterable["BridgeTransport"]:
+    def enumerate(
+        cls, _models: Optional[Iterable["TrezorModel"]] = None
+    ) -> Iterable["BridgeTransport"]:
         try:
             legacy = is_legacy_bridge()
             return [
@@ -145,7 +155,12 @@ class BridgeTransport(Transport):
             return []
 
     def begin_session(self) -> None:
-        data = self._call("acquire/" + self.device["path"])
+        try:
+            data = self._call("acquire/" + self.device["path"])
+        except BridgeException as e:
+            if e.message == "wrong previous session":
+                raise DeviceIsBusy(self.device["path"]) from e
+            raise
         self.session = data.json()["session"]
 
     def end_session(self) -> None:

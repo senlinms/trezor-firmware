@@ -1,4 +1,5 @@
-from trezor import loop, utils, wire, workflow
+# isort: skip_file
+from trezor import log, loop, utils, wire, workflow
 
 import apps.base
 import usb
@@ -25,3 +26,6 @@ if __debug__:
     wire.setup(usb.iface_debug, is_debug_session=True)
 
 loop.run()
+
+if __debug__:
+    log.debug(__name__, "Restarting main loop")

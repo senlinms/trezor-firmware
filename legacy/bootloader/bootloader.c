@@ -25,12 +25,13 @@
 
 #include "bootloader.h"
 #include "buttons.h"
+#include "compiler_traits.h"
+#include "fw_signatures.h"
 #include "layout.h"
 #include "memory.h"
 #include "oled.h"
 #include "rng.h"
 #include "setup.h"
-#include "signatures.h"
 #include "supervise.h"
 #include "usb.h"
 #include "util.h"
@@ -64,6 +65,12 @@ void show_unplug(const char *line1, const char *line2) {
 }
 
 static void show_unofficial_warning(const uint8_t *hash) {
+// On production bootloader, show warning and wait for user
+// to accept or reject it
+// On non-production we only use unofficial firmwares,
+// so just show hash for a while to see bootloader started
+// but continue
+#if PRODUCTION
   layoutDialog(&bmp_icon_warning, "Abort", "I'll take the risk", NULL,
                "WARNING!", NULL, "Unofficial firmware", "detected.", NULL,
                NULL);
@@ -81,6 +88,10 @@ static void show_unofficial_warning(const uint8_t *hash) {
   }
 
   // everything is OK, user pressed 2x Continue -> continue program
+#else
+  layoutFirmwareFingerprint(hash);
+  delay(100000000);
+#endif
 }
 
 static void __attribute__((noreturn)) load_app(int signed_firmware) {
@@ -146,10 +157,16 @@ int main(void) {
         (const image_header *)FLASH_PTR(FLASH_FWHEADER_START);
 
     uint8_t fingerprint[32] = {0};
-    int signed_firmware = signatures_new_ok(hdr, fingerprint);
+    int signed_firmware = signatures_match(hdr, fingerprint);
     if (SIG_OK != signed_firmware) {
       show_unofficial_warning(fingerprint);
     }
+#if !PRODUCTION && !BOOTLOADER_QA && !DEBUG_T1_SIGNATURES
+    // try to avoid bricking board SWD debug by accident
+    else {
+      show_halt("Official firmware", "Won't run on debug device");
+    }
+#endif
 
     if (SIG_OK != check_firmware_hashes(hdr)) {
       show_halt("Broken firmware", "detected.");

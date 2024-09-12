@@ -24,8 +24,7 @@
 #include <stdint.h>
 #include "secbool.h"
 
-#define XSTR(s) STR(s)
-#define STR(s) #s
+#include "platform.h"
 
 #ifndef MIN_8bits
 #define MIN_8bits(a, b)                  \
@@ -52,12 +51,23 @@
   })
 #endif
 
+#define STAY_IN_BOOTLOADER_FLAG 0x0FC35A96
+
+// from linker script
+extern uint8_t firmware_header_start;
+extern uint8_t ccmram_start;
+extern uint8_t ccmram_end;
+
+void __attribute__((noreturn)) trezor_shutdown(void);
+
 void __attribute__((noreturn))
 __fatal_error(const char *expr, const char *msg, const char *file, int line,
               const char *func);
 void __attribute__((noreturn))
-error_shutdown(const char *line1, const char *line2, const char *line3,
-               const char *line4);
+error_shutdown(const char *label, const char *msg);
+
+void show_wipe_code_screen(void);
+void show_pin_too_many_screen(void);
 
 #define ensure(expr, msg) \
   (((expr) == sectrue)    \
@@ -65,26 +75,11 @@ error_shutdown(const char *line1, const char *line2, const char *line3,
        : __fatal_error(#expr, msg, __FILE__, __LINE__, __func__))
 
 void hal_delay(uint32_t ms);
-
-void wait_random(void);
-
-void clear_otg_hs_memory(void);
-
-extern uint32_t __stack_chk_guard;
+uint32_t hal_ticks_ms();
+void hal_delay_us(uint16_t delay_us);
 
 void collect_hw_entropy(void);
 #define HW_ENTROPY_LEN (12 + 32)
 extern uint8_t HW_ENTROPY_DATA[HW_ENTROPY_LEN];
-
-void drbg_init(void);
-void drbg_reseed(const uint8_t *entropy, size_t len);
-void drbg_generate(uint8_t *buf, size_t len);
-uint32_t drbg_random32(void);
-
-// the following functions are defined in util.s
-
-void memset_reg(volatile void *start, volatile void *stop, uint32_t val);
-void jump_to(uint32_t address);
-void jump_to_unprivileged(uint32_t address);
 
 #endif

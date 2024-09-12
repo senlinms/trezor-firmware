@@ -1,9 +1,10 @@
 import ustruct
 from micropython import const
+from typing import TYPE_CHECKING
 
 from trezor import io, loop, utils
 
-if False:
+if TYPE_CHECKING:
     from trezorio import WireInterface
 
 _REP_LEN = const(64)
@@ -15,7 +16,6 @@ _REP_INIT_DATA = const(9)  # offset of data in the initial report
 _REP_CONT_DATA = const(1)  # offset of data in the continuation report
 
 SESSION_ID = const(0)
-INVALID_TYPE = const(-1)
 
 
 class CodecError(Exception):
@@ -23,7 +23,7 @@ class CodecError(Exception):
 
 
 class Message:
-    def __init__(self, mtype: int, mdata: utils.BufferReader) -> None:
+    def __init__(self, mtype: int, mdata: bytes) -> None:
         self.type = mtype
         self.data = mdata
 
@@ -70,7 +70,7 @@ async def read_message(iface: WireInterface, buffer: utils.BufferType) -> Messag
     if read_and_throw_away:
         raise CodecError("Message too large")
 
-    return Message(mtype, utils.BufferReader(mdata))
+    return Message(mtype, mdata)
 
 
 async def write_message(iface: WireInterface, mtype: int, mdata: bytes) -> None:

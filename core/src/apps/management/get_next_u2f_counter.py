@@ -1,22 +1,24 @@
-import storage.device
-from trezor import ui, wire
-from trezor.messages import ButtonRequestType
-from trezor.messages.GetNextU2FCounter import GetNextU2FCounter
-from trezor.messages.NextU2FCounter import NextU2FCounter
-from trezor.ui.components.tt.text import Text
+from typing import TYPE_CHECKING
 
-from apps.common.confirm import require_confirm
+if TYPE_CHECKING:
+    from trezor.messages import GetNextU2FCounter, NextU2FCounter
 
 
-async def get_next_u2f_counter(
-    ctx: wire.Context, msg: GetNextU2FCounter
-) -> NextU2FCounter:
-    if not storage.device.is_initialized():
-        raise wire.NotInitialized("Device is not initialized")
-    text = Text("Get next U2F counter", ui.ICON_CONFIG)
-    text.normal("Do you really want to")
-    text.bold("increase and retrieve")
-    text.normal("the U2F counter?")
-    await require_confirm(ctx, text, code=ButtonRequestType.ProtectCall)
+async def get_next_u2f_counter(msg: GetNextU2FCounter) -> NextU2FCounter:
+    import storage.device as storage_device
+    from trezor.enums import ButtonRequestType
+    from trezor.messages import NextU2FCounter
+    from trezor.ui.layouts import confirm_action
+    from trezor.wire import NotInitialized
 
-    return NextU2FCounter(u2f_counter=storage.device.next_u2f_counter())
+    if not storage_device.is_initialized():
+        raise NotInitialized("Device is not initialized")
+
+    await confirm_action(
+        "get_u2f_counter",
+        "Get U2F counter",
+        description="Increase and retrieve the U2F counter?",
+        br_code=ButtonRequestType.ProtectCall,
+    )
+
+    return NextU2FCounter(u2f_counter=storage_device.next_u2f_counter())

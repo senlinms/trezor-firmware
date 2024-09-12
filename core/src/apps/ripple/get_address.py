@@ -1,24 +1,39 @@
-from trezor.messages.RippleAddress import RippleAddress
-from trezor.messages.RippleGetAddress import RippleGetAddress
-from trezor.ui.layouts import show_address
+from typing import TYPE_CHECKING
 
-from apps.common import paths
 from apps.common.keychain import auto_keychain
-from apps.common.layout import address_n_to_str
 
-from .helpers import address_from_public_key
+if TYPE_CHECKING:
+    from trezor.messages import RippleAddress, RippleGetAddress
+
+    from apps.common.keychain import Keychain
 
 
 @auto_keychain(__name__)
-async def get_address(ctx, msg: RippleGetAddress, keychain):
-    await paths.validate_path(ctx, keychain, msg.address_n)
+async def get_address(msg: RippleGetAddress, keychain: Keychain) -> RippleAddress:
+    # NOTE: local imports here saves 20 bytes
+    from trezor.messages import RippleAddress
+    from trezor.ui.layouts import show_address
 
-    node = keychain.derive(msg.address_n)
+    from apps.common import paths
+
+    from .helpers import address_from_public_key
+
+    address_n = msg.address_n  # local_cache_attribute
+
+    await paths.validate_path(keychain, address_n)
+
+    node = keychain.derive(address_n)
     pubkey = node.public_key()
     address = address_from_public_key(pubkey)
 
     if msg.show_display:
-        desc = address_n_to_str(msg.address_n)
-        await show_address(ctx, address=address, address_qr=address, desc=desc)
+        from . import PATTERN, SLIP44_ID
+
+        await show_address(
+            address,
+            path=paths.address_n_to_str(address_n),
+            account=paths.get_account_name("XRP", msg.address_n, PATTERN, SLIP44_ID),
+            chunkify=bool(msg.chunkify),
+        )
 
     return RippleAddress(address=address)

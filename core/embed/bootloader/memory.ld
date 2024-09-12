@@ -8,7 +8,7 @@ MEMORY {
   SRAM   (wal) : ORIGIN = 0x20000000, LENGTH = 192K
 }
 
-main_stack_base = ORIGIN(CCMRAM) + LENGTH(CCMRAM); /* 8-byte aligned full descending stack */
+main_stack_base = ORIGIN(CCMRAM) + SIZEOF(.stack) ; /* 8-byte aligned full descending stack */
 
 /* used by the startup code to populate variables used by the C code */
 data_lma = LOADADDR(.data);
@@ -22,6 +22,9 @@ ccmram_end = ORIGIN(CCMRAM) + LENGTH(CCMRAM);
 /* used by the startup code to wipe memory */
 sram_start = ORIGIN(SRAM);
 sram_end = ORIGIN(SRAM) + LENGTH(SRAM);
+
+/* IMAGE_HEADER_SIZE is 0x400, this is for interaction-less firmware update start */
+firmware_header_start = ccmram_end - 0x400;
 
 _codelen = SIZEOF(.flash) + SIZEOF(.data);
 
@@ -39,17 +42,27 @@ SECTIONS {
     . = ALIGN(512);
   } >FLASH AT>FLASH
 
+  .stack : ALIGN(8) {
+    . = 16K; /* Exactly 16K allocated for stack. Overflow causes MemManage fault (when using MPU). */
+  } >CCMRAM
+
   .data : ALIGN(4) {
     *(.data*);
     . = ALIGN(512);
   } >CCMRAM AT>FLASH
+
+  /DISCARD/ : {
+    *(.ARM.exidx*);
+  }
 
   .bss : ALIGN(4) {
     *(.bss*);
     . = ALIGN(4);
   } >CCMRAM
 
-  .stack : ALIGN(8) {
-    . = 4K; /* this acts as a build time assertion that at least this much memory is available for stack use */
-  } >CCMRAM
+  .buf : ALIGN(4) {
+    *(.buf*);
+    . = ALIGN(4);
+  } >SRAM
+
 }

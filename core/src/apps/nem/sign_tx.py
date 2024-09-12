@@ -1,73 +1,87 @@
-from trezor import wire
-from trezor.crypto.curve import ed25519
-from trezor.messages.NEMSignedTx import NEMSignedTx
-from trezor.messages.NEMSignTx import NEMSignTx
+from typing import TYPE_CHECKING
 
-from apps.common import seed
 from apps.common.keychain import with_slip44_keychain
-from apps.common.paths import validate_path
 
-from . import CURVE, PATTERNS, SLIP44_ID, mosaic, multisig, namespace, transfer
-from .helpers import NEM_HASH_ALG, check_path
-from .validators import validate
+from . import CURVE, PATTERNS, SLIP44_ID
+
+if TYPE_CHECKING:
+    from trezor.messages import NEMSignedTx, NEMSignTx
+
+    from apps.common.keychain import Keychain
 
 
 @with_slip44_keychain(*PATTERNS, slip44_id=SLIP44_ID, curve=CURVE)
-async def sign_tx(ctx, msg: NEMSignTx, keychain):
+async def sign_tx(msg: NEMSignTx, keychain: Keychain) -> NEMSignedTx:
+    from trezor.crypto.curve import ed25519
+    from trezor.messages import NEMSignedTx
+    from trezor.wire import DataError
+
+    from apps.common import seed
+    from apps.common.paths import validate_path
+
+    from . import mosaic, multisig, namespace, transfer
+    from .helpers import NEM_HASH_ALG, check_path
+    from .validators import validate
+
     validate(msg)
+    msg_multisig = msg.multisig  # local_cache_attribute
+    transaction = msg.transaction  # local_cache_attribute
 
     await validate_path(
-        ctx,
         keychain,
-        msg.transaction.address_n,
-        check_path(msg.transaction.address_n, msg.transaction.network),
+        transaction.address_n,
+        check_path(transaction.address_n, transaction.network),
     )
 
-    node = keychain.derive(msg.transaction.address_n)
+    node = keychain.derive(transaction.address_n)
 
-    if msg.multisig:
-        public_key = msg.multisig.signer
-        common = msg.multisig
-        await multisig.ask(ctx, msg)
+    if msg_multisig:
+        if msg_multisig.signer is None:
+            raise DataError("No signer provided")
+        public_key = msg_multisig.signer
+        common = msg_multisig
+        await multisig.ask(msg)
     else:
         public_key = seed.remove_ed25519_prefix(node.public_key())
-        common = msg.transaction
+        common = transaction
 
     if msg.transfer:
-        tx = await transfer.transfer(ctx, public_key, common, msg.transfer, node)
+        tx = await transfer.transfer(
+            public_key, common, msg.transfer, node, chunkify=bool(msg.chunkify)
+        )
     elif msg.provision_namespace:
-        tx = await namespace.namespace(ctx, public_key, common, msg.provision_namespace)
+        tx = await namespace.namespace(public_key, common, msg.provision_namespace)
     elif msg.mosaic_creation:
-        tx = await mosaic.mosaic_creation(ctx, public_key, common, msg.mosaic_creation)
+        tx = await mosaic.mosaic_creation(public_key, common, msg.mosaic_creation)
     elif msg.supply_change:
-        tx = await mosaic.supply_change(ctx, public_key, common, msg.supply_change)
+        tx = await mosaic.supply_change(public_key, common, msg.supply_change)
     elif msg.aggregate_modification:
         tx = await multisig.aggregate_modification(
-            ctx,
             public_key,
             common,
             msg.aggregate_modification,
-            msg.multisig is not None,
+            msg_multisig is not None,
         )
     elif msg.importance_transfer:
         tx = await transfer.importance_transfer(
-            ctx, public_key, common, msg.importance_transfer
+            public_key, common, msg.importance_transfer
         )
     else:
-        raise wire.DataError("No transaction provided")
+        raise DataError("No transaction provided")
 
-    if msg.multisig:
+    if msg_multisig:
         # wrap transaction in multisig wrapper
         if msg.cosigning:
+            assert msg_multisig.signer is not None
             tx = multisig.cosign(
                 seed.remove_ed25519_prefix(node.public_key()),
-                msg.transaction,
+                transaction,
                 tx,
-                msg.multisig.signer,
+                msg_multisig.signer,
             )
         else:
             tx = multisig.initiate(
-                seed.remove_ed25519_prefix(node.public_key()), msg.transaction, tx
+                seed.remove_ed25519_prefix(node.public_key()), transaction, tx
             )
 
     signature = ed25519.sign(node.private_key(), tx, NEM_HASH_ALG)

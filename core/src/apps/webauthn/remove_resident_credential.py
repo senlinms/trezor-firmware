@@ -1,37 +1,18 @@
-import storage.device
-import storage.resident_credentials
-from trezor import wire
-from trezor.messages.Success import Success
-from trezor.messages.WebAuthnRemoveResidentCredential import (
-    WebAuthnRemoveResidentCredential,
-)
+from typing import TYPE_CHECKING
 
-from apps.common.confirm import require_confirm
-
-from .confirm import ConfirmContent, ConfirmInfo
-from .credential import Fido2Credential
-from .resident_credentials import get_resident_credential
+if TYPE_CHECKING:
+    from trezor.messages import Success, WebAuthnRemoveResidentCredential
 
 
-class ConfirmRemoveCredential(ConfirmInfo):
-    def __init__(self, cred: Fido2Credential):
-        super().__init__()
-        self._cred = cred
-        self.load_icon(cred.rp_id_hash)
+async def remove_resident_credential(msg: WebAuthnRemoveResidentCredential) -> Success:
+    import storage.device
+    import storage.resident_credentials
+    from trezor import wire
+    from trezor.messages import Success
+    from trezor.ui.layouts.fido import confirm_fido
 
-    def get_header(self) -> str:
-        return "Remove credential"
+    from .resident_credentials import get_resident_credential
 
-    def app_name(self) -> str:
-        return self._cred.app_name()
-
-    def account_name(self) -> str | None:
-        return self._cred.account_name()
-
-
-async def remove_resident_credential(
-    ctx: wire.Context, msg: WebAuthnRemoveResidentCredential
-) -> Success:
     if not storage.device.is_initialized():
         raise wire.NotInitialized("Device is not initialized")
     if msg.index is None:
@@ -41,8 +22,12 @@ async def remove_resident_credential(
     if cred is None:
         raise wire.ProcessError("Invalid credential index.")
 
-    content = ConfirmContent(ConfirmRemoveCredential(cred))
-    await require_confirm(ctx, content)
+    await confirm_fido(
+        "Remove credential",
+        cred.app_name(),
+        cred.icon_name(),
+        [cred.account_name()],
+    )
 
     assert cred.index is not None
     storage.resident_credentials.delete(cred.index)

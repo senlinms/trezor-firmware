@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "lib/utils/pyexec.h"
+#include "py/builtin.h"
 #include "py/compile.h"
 #include "py/gc.h"
 #include "py/mperrno.h"
@@ -31,35 +31,75 @@
 #include "py/repl.h"
 #include "py/runtime.h"
 #include "py/stackctrl.h"
+#include "shared/runtime/pyexec.h"
 
 #include "ports/stm32/gccollect.h"
 #include "ports/stm32/pendsv.h"
 
 #include "bl_check.h"
+#include "board_capabilities.h"
 #include "common.h"
+#include "compiler_traits.h"
 #include "display.h"
 #include "flash.h"
+#include "image.h"
+#include "memzero.h"
+#include "model.h"
 #include "mpu.h"
-#ifdef RDI
-#include "rdi.h"
+#include "random_delays.h"
+
+#include TREZOR_BOARD
+
+#ifdef USE_RGB_LED
+#include "rgb_led.h"
 #endif
+#ifdef USE_CONSUMPTION_MASK
+#include "consumption_mask.h"
+#endif
+#ifdef USE_DMA2D
+#include "dma2d.h"
+#endif
+#ifdef USE_BUTTON
+#include "button.h"
+#endif
+#ifdef USE_I2C
+#include "i2c.h"
+#endif
+#ifdef USE_TOUCH
+#include "touch.h"
+#endif
+#ifdef USE_SD_CARD
+#include "sdcard.h"
+#endif
+#ifdef USE_OPTIGA
+#include "optiga_commands.h"
+#include "optiga_transport.h"
+#include "secret.h"
+#endif
+#include "unit_variant.h"
+
 #ifdef SYSTEM_VIEW
 #include "systemview.h"
 #endif
+#include "platform.h"
 #include "rng.h"
-#include "sdcard.h"
 #include "supervise.h"
-#include "touch.h"
+#ifdef USE_SECP256K1_ZKP
+#include "zkp_context.h"
+#endif
+
+// from util.s
+extern void shutdown_privileged(void);
 
 int main(void) {
-  // initialize pseudo-random number generator
-  drbg_init();
+  random_delays_init();
+
 #ifdef RDI
   rdi_start();
 #endif
 
   // reinitialize HAL for Trezor One
-#if TREZOR_MODEL == 1
+#if defined TREZOR_MODEL_1
   HAL_Init();
 #endif
 
@@ -69,8 +109,20 @@ int main(void) {
   enable_systemview();
 #endif
 
-#if TREZOR_MODEL == T
-#if PRODUCTION
+  display_reinit();
+
+#if !defined TREZOR_MODEL_1
+  parse_boardloader_capabilities();
+
+  unit_variant_init();
+
+#ifdef USE_OPTIGA
+  uint8_t secret[SECRET_OPTIGA_KEY_LEN] = {0};
+  secbool secret_ok =
+      secret_read(secret, SECRET_OPTIGA_KEY_OFFSET, SECRET_OPTIGA_KEY_LEN);
+#endif
+
+#if PRODUCTION || BOOTLOADER_QA
   check_and_replace_bootloader();
 #endif
   // Enable MPU
@@ -80,30 +132,65 @@ int main(void) {
   // Init peripherals
   pendsv_init();
 
-#if TREZOR_MODEL == 1
-  display_init();
+#ifdef USE_DMA2D
+  dma2d_init();
+#endif
+
+#if !PRODUCTION
+  // enable BUS fault and USAGE fault handlers
+  SCB->SHCSR |= (SCB_SHCSR_USGFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk);
+#endif
+
+#if defined TREZOR_MODEL_T
+  set_core_clock(CLOCK_180_MHZ);
+#endif
+
+#ifdef USE_BUTTON
+  button_init();
+#endif
+
+#ifdef USE_RGB_LED
+  rgb_led_init();
+#endif
+
+#ifdef USE_CONSUMPTION_MASK
+  consumption_mask_init();
+#endif
+
+#ifdef USE_I2C
+  i2c_init();
+#endif
+
+#ifdef USE_TOUCH
   touch_init();
 #endif
 
-#if TREZOR_MODEL == T
-  // display_init_seq();
+#ifdef USE_SD_CARD
   sdcard_init();
-  touch_init();
-  touch_power_on();
+#endif
 
-  // jump to unprivileged mode
-  // http://infocenter.arm.com/help/topic/com.arm.doc.dui0552a/CHDBIBGJ.html
-  __asm__ volatile("msr control, %0" ::"r"(0x1));
-  __asm__ volatile("isb");
+#ifdef USE_OPTIGA
+  optiga_init();
+  optiga_open_application();
+  if (sectrue == secret_ok) {
+    optiga_sec_chan_handshake(secret, sizeof(secret));
+  }
+  memzero(secret, sizeof(secret));
+#endif
 
-  display_clear();
+#if !defined TREZOR_MODEL_1
+  drop_privileges();
+#endif
+
+#ifdef USE_SECP256K1_ZKP
+  ensure(sectrue * (zkp_context_init() == 0), NULL);
 #endif
 
   printf("CORE: Preparing stack\n");
   // Stack limit should be less than real stack size, so we have a chance
   // to recover from limit hit.
   mp_stack_set_top(&_estack);
-  mp_stack_set_limit((char *)&_estack - (char *)&_heap_end - 1024);
+  mp_stack_set_limit((char *)&_estack - (char *)&_sstack - 1024);
 
 #if MICROPY_ENABLE_PYSTACK
   static mp_obj_t pystack[1024];
@@ -119,9 +206,7 @@ int main(void) {
   mp_init();
   mp_obj_list_init(mp_sys_argv, 0);
   mp_obj_list_init(mp_sys_path, 0);
-  mp_obj_list_append(
-      mp_sys_path,
-      MP_OBJ_NEW_QSTR(MP_QSTR_));  // current dir (or base dir of the script)
+  mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR__dot_frozen));
 
   // Execute the main script
   printf("CORE: Executing main script\n");
@@ -137,7 +222,7 @@ int main(void) {
 // MicroPython default exception handler
 
 void __attribute__((noreturn)) nlr_jump_fail(void *val) {
-  error_shutdown("Internal error", "(UE)", NULL, NULL);
+  error_shutdown("INTERNAL ERROR", "(UE)");
 }
 
 // interrupt handlers
@@ -145,28 +230,35 @@ void __attribute__((noreturn)) nlr_jump_fail(void *val) {
 void NMI_Handler(void) {
   // Clock Security System triggered NMI
   if ((RCC->CIR & RCC_CIR_CSSF) != 0) {
-    error_shutdown("Internal error", "(CS)", NULL, NULL);
+    error_shutdown("INTERNAL ERROR", "(CS)");
   }
 }
 
-void HardFault_Handler(void) {
-  error_shutdown("Internal error", "(HF)", NULL, NULL);
+void HardFault_Handler(void) { error_shutdown("INTERNAL ERROR", "(HF)"); }
+
+void MemManage_Handler_MM(void) { error_shutdown("INTERNAL ERROR", "(MM)"); }
+
+void MemManage_Handler_SO(void) { error_shutdown("INTERNAL ERROR", "(SO)"); }
+
+void BusFault_Handler(void) { error_shutdown("INTERNAL ERROR", "(BF)"); }
+
+void UsageFault_Handler(void) { error_shutdown("INTERNAL ERROR", "(UF)"); }
+
+__attribute__((noreturn)) void reboot_to_bootloader() {
+  mpu_config_bootloader();
+  jump_to_with_flag(BOOTLOADER_START + IMAGE_HEADER_SIZE,
+                    STAY_IN_BOOTLOADER_FLAG);
+  for (;;)
+    ;
 }
 
-void MemManage_Handler(void) {
-  error_shutdown("Internal error", "(MM)", NULL, NULL);
-}
-
-void BusFault_Handler(void) {
-  error_shutdown("Internal error", "(BF)", NULL, NULL);
-}
-
-void UsageFault_Handler(void) {
-  error_shutdown("Internal error", "(UF)", NULL, NULL);
+void copy_image_header_for_bootloader(const uint8_t *image_header) {
+  memcpy(&firmware_header_start, image_header, IMAGE_HEADER_SIZE);
 }
 
 void SVC_C_Handler(uint32_t *stack) {
   uint8_t svc_number = ((uint8_t *)stack[6])[-2];
+  bool clear_firmware_header = true;
   switch (svc_number) {
     case SVC_ENABLE_IRQ:
       HAL_NVIC_EnableIRQ(stack[0]);
@@ -182,6 +274,35 @@ void SVC_C_Handler(uint32_t *stack) {
       cyccnt_cycles = *DWT_CYCCNT_ADDR;
       break;
 #endif
+    case SVC_SHUTDOWN:
+      shutdown_privileged();
+      for (;;)
+        ;
+      break;
+    case SVC_REBOOT_COPY_IMAGE_HEADER:
+      copy_image_header_for_bootloader((uint8_t *)stack[0]);
+      clear_firmware_header = false;
+      // break is omitted here because we want to continue to reboot below
+    case SVC_REBOOT_TO_BOOTLOADER:
+      // if not going from copy image header & reboot, clean preventively this
+      // part of CCMRAM
+      if (clear_firmware_header) {
+        explicit_bzero(&firmware_header_start, IMAGE_HEADER_SIZE);
+      }
+
+      ensure_compatible_settings();
+
+      __asm__ volatile("msr control, %0" ::"r"(0x0));
+      __asm__ volatile("isb");
+      // See stack layout in
+      // https://developer.arm.com/documentation/ka004005/latest We are changing
+      // return address in PC to land into reboot to avoid any bug with ROP and
+      // raising privileges.
+      stack[6] = (uintptr_t)reboot_to_bootloader;
+      return;
+    case SVC_GET_SYSTICK_VAL: {
+      systick_val_copy = SysTick->VAL;
+    } break;
     default:
       stack[0] = 0xffffffff;
       break;

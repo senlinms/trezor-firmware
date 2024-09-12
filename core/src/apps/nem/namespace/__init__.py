@@ -1,14 +1,15 @@
-from trezor.messages.NEMProvisionNamespace import NEMProvisionNamespace
-from trezor.messages.NEMTransactionCommon import NEMTransactionCommon
+from typing import TYPE_CHECKING
 
-from . import layout, serialize
+if TYPE_CHECKING:
+    from trezor.messages import NEMProvisionNamespace, NEMTransactionCommon
 
 
 async def namespace(
-    ctx,
     public_key: bytes,
     common: NEMTransactionCommon,
     namespace: NEMProvisionNamespace,
-) -> bytearray:
-    await layout.ask_provision_namespace(ctx, common, namespace)
+) -> bytes:
+    from . import layout, serialize
+
+    await layout.ask_provision_namespace(common, namespace)
     return serialize.serialize_provision_namespace(common, namespace, public_key)

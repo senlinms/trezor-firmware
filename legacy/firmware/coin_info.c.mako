@@ -23,13 +23,14 @@ def hex(x):
 #include "secp256k1.h"
 
 const CoinInfo coins[COINS_COUNT] = {
-% for c in supported_on("trezor1", bitcoin):
+% for c in supported_on("T1B1", bitcoin):
 {
 	.coin_name = ${c_str(c.coin_name)},
 	.coin_shortcut = ${c_str(c.coin_shortcut)},
 	.maxfee_kb = ${c_int(c.maxfee_kb)},
 	.signed_message_header = ${signed_message_header(c.signed_message_header)},
 	.has_segwit = ${c_bool(c.segwit)},
+	.has_taproot = ${c_bool(c.taproot)},
 	.has_fork_id = ${defined(c.fork_id)},
 	.force_bip143 = ${c_bool(c.force_bip143)},
 	.decred = ${c_bool(c.decred)},
@@ -50,7 +51,7 @@ const CoinInfo coins[COINS_COUNT] = {
 	.curve = &${c.curve_name}_info,
 	.extra_data = ${c_bool(c.extra_data)},
 	.timestamp = ${c_bool(c.timestamp)},
-	.overwintered = ${c_bool(c.consensus_branch_id)},
+	.overwintered = ${c_bool(c.overwintered)},
 },
 % endfor
 };

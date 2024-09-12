@@ -1,39 +1,45 @@
-from trezor import ui
-from trezor.messages import ButtonRequestType
+from trezor.enums import ButtonRequestType
 from trezor.strings import format_amount
-from trezor.ui.components.tt.text import Text
-
-from apps.common.confirm import require_confirm, require_hold_to_confirm
+from trezor.ui.layouts import confirm_metadata
 
 from .helpers import NEM_MAX_DIVISIBILITY
 
 
-async def require_confirm_text(ctx, action: str):
-    text = Text("Confirm action", ui.ICON_SEND, ui.GREEN, new_lines=False)
-    text.normal(action)
-    await require_confirm(ctx, text, ButtonRequestType.ConfirmOutput)
-
-
-async def require_confirm_fee(ctx, action: str, fee: int):
-    content = (
-        ui.NORMAL,
+async def require_confirm_text(action: str) -> None:
+    await confirm_metadata(
+        "confirm_nem",
+        "Confirm action",
         action,
-        ui.BOLD,
-        "%s XEM" % format_amount(fee, NEM_MAX_DIVISIBILITY),
+        br_code=ButtonRequestType.ConfirmOutput,
     )
-    await require_confirm_content(ctx, "Confirm fee", content)
 
 
-async def require_confirm_content(ctx, headline: str, content: list):
-    text = Text(headline, ui.ICON_SEND, ui.GREEN)
-    text.normal(*content)
-    await require_confirm(ctx, text, ButtonRequestType.ConfirmOutput)
+async def require_confirm_fee(action: str, fee: int) -> None:
+    await confirm_metadata(
+        "confirm_fee",
+        "Confirm fee",
+        action + "\n{}",
+        f"{format_amount(fee, NEM_MAX_DIVISIBILITY)} XEM",
+        ButtonRequestType.ConfirmOutput,
+    )
 
 
-async def require_confirm_final(ctx, fee: int):
-    text = Text("Final confirm", ui.ICON_SEND, ui.GREEN)
-    text.normal("Sign this transaction")
-    text.bold("and pay %s XEM" % format_amount(fee, NEM_MAX_DIVISIBILITY))
-    text.normal("for network fee?")
+async def require_confirm_content(headline: str, content: list) -> None:
+    from trezor.ui.layouts import confirm_properties
+
+    await confirm_properties(
+        "confirm_content",
+        headline,
+        content,
+    )
+
+
+async def require_confirm_final(fee: int) -> None:
     # we use SignTx, not ConfirmOutput, for compatibility with T1
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+    await confirm_metadata(
+        "confirm_final",
+        "Final confirm",
+        "Sign this transaction\n{}\nfor network fee?",
+        f"and pay {format_amount(fee, NEM_MAX_DIVISIBILITY)} XEM",
+        hold=True,
+    )

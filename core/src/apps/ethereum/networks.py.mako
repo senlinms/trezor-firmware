@@ -1,71 +1,79 @@
 # generated from networks.py.mako
+# (by running `make templates` in `core`)
 # do not edit manually!
 
-from micropython import const
+# NOTE: using positional arguments saves 4400 bytes in flash size,
+# returning tuples instead of classes saved 800 bytes
 
-from apps.common import HARDENED
+from typing import TYPE_CHECKING
 
-SLIP44_WANCHAIN = const(5718350)
-SLIP44_ETHEREUM = const(60)
+from trezor import utils
+from trezor.messages import EthereumNetworkInfo
 
-if False:
+if TYPE_CHECKING:
     from typing import Iterator
 
+    # Removing the necessity to construct object to save space
+    # fmt: off
+    NetworkInfoTuple = tuple[
+        int,  # chain_id
+        int,  # slip44
+        str,  # symbol
+        str,  # name
+    ]
+    # fmt: on
 
-def is_wanchain(chain_id: int, tx_type: int) -> bool:
-    return tx_type in (1, 6) and chain_id in (1, 3)
+UNKNOWN_NETWORK = EthereumNetworkInfo(
+    chain_id=0,
+    slip44=0,
+    symbol="UNKN",
+    name="Unknown network",
+)
 
 
-def shortcut_by_chain_id(chain_id: int, tx_type: int = None) -> str:
-    if is_wanchain(chain_id, tx_type):
-        return "WAN"
-    else:
-        n = by_chain_id(chain_id)
-        return n.shortcut if n is not None else "UNKN"
-
-
-def by_chain_id(chain_id: int) -> "NetworkInfo" | None:
+def by_chain_id(chain_id: int) -> EthereumNetworkInfo:
     for n in _networks_iterator():
-        if n.chain_id == chain_id:
-            return n
-    return None
+        n_chain_id = n[0]
+        if n_chain_id == chain_id:
+            return EthereumNetworkInfo(
+                chain_id=n[0],
+                slip44=n[1],
+                symbol=n[2],
+                name=n[3],
+            )
+    return UNKNOWN_NETWORK
 
 
-def by_slip44(slip44: int) -> "NetworkInfo" | None:
-    if slip44 == SLIP44_WANCHAIN:
-        # Coerce to Ethereum
-        slip44 = SLIP44_ETHEREUM
+def by_slip44(slip44: int) -> EthereumNetworkInfo:
     for n in _networks_iterator():
-        if n.slip44 == slip44:
-            return n
-    return None
-
-
-def all_slip44_ids_hardened() -> Iterator[int]:
-    for n in _networks_iterator():
-        yield n.slip44 | HARDENED
-    yield SLIP44_WANCHAIN | HARDENED
-
-
-class NetworkInfo:
-    def __init__(
-        self, chain_id: int, slip44: int, shortcut: str, name: str, rskip60: bool
-    ) -> None:
-        self.chain_id = chain_id
-        self.slip44 = slip44
-        self.shortcut = shortcut
-        self.name = name
-        self.rskip60 = rskip60
+        n_slip44 = n[1]
+        if n_slip44 == slip44:
+            return EthereumNetworkInfo(
+                chain_id=n[0],
+                slip44=n[1],
+                symbol=n[2],
+                name=n[3],
+            )
+    return UNKNOWN_NETWORK
 
 
 # fmt: off
-def _networks_iterator() -> Iterator[NetworkInfo]:
-% for n in supported_on("trezor2", eth):
-    yield NetworkInfo(
-        chain_id=${n.chain_id},
-        slip44=${n.slip44},
-        shortcut="${n.shortcut}",
-        name="${n.name}",
-        rskip60=${n.rskip60},
-    )
+def _networks_iterator() -> Iterator[NetworkInfoTuple]:
+    if utils.MODEL_IS_T2B1:
+% for n in sorted(supported_on("T2B1", eth), key=lambda network: (int(network.chain_id), network.name)):
+        yield (
+            ${n.chain_id},  # chain_id
+            ${n.slip44},  # slip44
+            "${n.shortcut}",  # symbol
+            "${n.name}",  # name
+        )
+% endfor
+    else:
+% for n in sorted(supported_on("T2T1", eth), key=lambda network: (int(network.chain_id), network.name)):
+        yield (
+            ${n.chain_id},  # chain_id
+            ${n.slip44},  # slip44
+            "${n.shortcut}",  # symbol
+            "${n.name}",  # name
+        )
 % endfor

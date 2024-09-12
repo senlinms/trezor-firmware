@@ -1,18 +1,21 @@
 from micropython import const
+from typing import TYPE_CHECKING
 
 import storage.device
-from trezor import fatfs
+from trezor import io, utils
 from trezor.sdcard import with_filesystem
-from trezor.utils import consteq
 
-if False:
-    from typing import TypeVar, Callable
+if TYPE_CHECKING:
+    from typing import Callable, TypeVar
 
     T = TypeVar("T", bound=Callable)
 
+if utils.USE_SD_CARD:
+    fatfs = io.fatfs  # global_import_cache
+
 SD_CARD_HOT_SWAPPABLE = False
 SD_SALT_LEN_BYTES = const(32)
-SD_SALT_AUTH_TAG_LEN_BYTES = const(16)
+_SD_SALT_AUTH_TAG_LEN_BYTES = const(16)
 
 
 class WrongSdCard(Exception):
@@ -27,24 +30,27 @@ def compute_auth_tag(salt: bytes, auth_key: bytes) -> bytes:
     from trezor.crypto import hmac
 
     digest = hmac(hmac.SHA256, auth_key, salt).digest()
-    return digest[:SD_SALT_AUTH_TAG_LEN_BYTES]
+    return digest[:_SD_SALT_AUTH_TAG_LEN_BYTES]
 
 
 def _get_device_dir() -> str:
-    return "/trezor/device_{}".format(storage.device.get_device_id().lower())
+    return f"/trezor/device_{storage.device.get_device_id().lower()}"
 
 
 def _get_salt_path(new: bool = False) -> str:
-    return "{}/salt{}".format(_get_device_dir(), ".new" if new else "")
+    ext = ".new" if new else ""
+    return f"{_get_device_dir()}/salt{ext}"
 
 
 @with_filesystem
 def _load_salt(auth_key: bytes, path: str) -> bytearray | None:
+    from trezor.utils import consteq
+
     # Load the salt file if it exists.
     try:
         with fatfs.open(path, "r") as f:
             salt = bytearray(SD_SALT_LEN_BYTES)
-            stored_tag = bytearray(SD_SALT_AUTH_TAG_LEN_BYTES)
+            stored_tag = bytearray(_SD_SALT_AUTH_TAG_LEN_BYTES)
             f.read(salt)
             f.read(stored_tag)
     except fatfs.FatFSError:

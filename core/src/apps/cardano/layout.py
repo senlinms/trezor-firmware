@@ -1,56 +1,59 @@
-import math
-from ubinascii import hexlify
+from typing import TYPE_CHECKING
 
 from trezor import ui
-from trezor.messages import (
+from trezor.enums import (
     ButtonRequestType,
     CardanoAddressType,
     CardanoCertificateType,
+    CardanoNativeScriptType,
 )
 from trezor.strings import format_amount
-from trezor.ui.components.tt.button import ButtonDefault
-from trezor.ui.components.tt.scroll import Paginated
-from trezor.ui.components.tt.text import Text
-from trezor.utils import chunks
+from trezor.ui import layouts
+from trezor.ui.layouts import confirm_metadata, confirm_properties
 
-from apps.common.confirm import confirm, require_confirm, require_hold_to_confirm
-from apps.common.layout import address_n_to_str
+from apps.common.paths import address_n_to_str
 
-from . import seed
-from .address import (
-    encode_human_readable_address,
-    get_public_key_hash,
-    pack_reward_address_bytes,
-)
-from .helpers import protocol_magics
+from . import addresses
+from .helpers import bech32, protocol_magics
 from .helpers.utils import (
     format_account_number,
     format_asset_fingerprint,
     format_optional_int,
     format_stake_pool_id,
-    to_account_path,
 )
 
-if False:
-    from trezor import wire
-    from trezor.messages.CardanoBlockchainPointerType import (
-        CardanoBlockchainPointerType,
-    )
-    from trezor.messages.CardanoTxCertificateType import CardanoTxCertificateType
-    from trezor.messages.CardanoTxWithdrawalType import CardanoTxWithdrawalType
-    from trezor.messages.CardanoPoolParametersType import CardanoPoolParametersType
-    from trezor.messages.CardanoPoolOwnerType import CardanoPoolOwnerType
-    from trezor.messages.CardanoPoolMetadataType import CardanoPoolMetadataType
-    from trezor.messages.CardanoAssetGroupType import CardanoAssetGroupType
-    from trezor.messages.CardanoAddressParametersType import EnumTypeCardanoAddressType
+if TYPE_CHECKING:
+    from typing import Literal
+
+    from trezor import messages
+    from trezor.enums import CardanoNativeScriptHashDisplayFormat
+    from trezor.ui.layouts import PropertyType
+
+    from .helpers.credential import Credential
+    from .seed import Keychain
 
 
 ADDRESS_TYPE_NAMES = {
     CardanoAddressType.BYRON: "Legacy",
     CardanoAddressType.BASE: "Base",
+    CardanoAddressType.BASE_SCRIPT_KEY: "Base",
+    CardanoAddressType.BASE_KEY_SCRIPT: "Base",
+    CardanoAddressType.BASE_SCRIPT_SCRIPT: "Base",
     CardanoAddressType.POINTER: "Pointer",
+    CardanoAddressType.POINTER_SCRIPT: "Pointer",
     CardanoAddressType.ENTERPRISE: "Enterprise",
+    CardanoAddressType.ENTERPRISE_SCRIPT: "Enterprise",
     CardanoAddressType.REWARD: "Reward",
+    CardanoAddressType.REWARD_SCRIPT: "Reward",
+}
+
+SCRIPT_TYPE_NAMES = {
+    CardanoNativeScriptType.PUB_KEY: "Key",
+    CardanoNativeScriptType.ALL: "All",
+    CardanoNativeScriptType.ANY: "Any",
+    CardanoNativeScriptType.N_OF_K: "N of K",
+    CardanoNativeScriptType.INVALID_BEFORE: "Invalid before",
+    CardanoNativeScriptType.INVALID_HEREAFTER: "Invalid hereafter",
 }
 
 CERTIFICATE_TYPE_NAMES = {
@@ -60,502 +63,870 @@ CERTIFICATE_TYPE_NAMES = {
     CardanoCertificateType.STAKE_POOL_REGISTRATION: "Stakepool registration",
 }
 
-# Maximum number of characters per line in monospace font.
-_MAX_MONO_LINE = 18
+BRT_Other = ButtonRequestType.Other  # global_import_cache
+
+CVOTE_REWARD_ELIGIBILITY_WARNING = (
+    "Warning: The address is not a payment address, it is not eligible for rewards."
+)
 
 
-def format_coin_amount(amount: int) -> str:
-    return "%s %s" % (format_amount(amount, 6), "ADA")
+def format_coin_amount(amount: int, network_id: int) -> str:
+    from .helpers import network_ids
+
+    currency = "ADA" if network_ids.is_mainnet(network_id) else "tADA"
+    return f"{format_amount(amount, 6)} {currency}"
 
 
-def is_printable_ascii_bytestring(bytestr: bytes) -> bool:
-    return all((32 < b < 127) for b in bytestr)
+async def show_native_script(
+    script: messages.CardanoNativeScript,
+    indices: list[int] | None = None,
+) -> None:
+    CNST = CardanoNativeScriptType  # local_cache_global
+    script_type = script.type  # local_cache_attribute
+    key_path = script.key_path  # local_cache_attribute
+    key_hash = script.key_hash  # local_cache_attribute
+    scripts = script.scripts  # local_cache_attribute
+
+    script_heading = "Script"
+    if indices is None:
+        indices = []
+    if indices:
+        script_heading += " " + ".".join(str(i) for i in indices)
+
+    script_type_name_suffix = ""
+    if script_type == CNST.PUB_KEY:
+        if key_path:
+            script_type_name_suffix = "path"
+        elif key_hash:
+            script_type_name_suffix = "hash"
+
+    props: list[PropertyType] = [
+        (
+            f"{script_heading} - {SCRIPT_TYPE_NAMES[script_type]} {script_type_name_suffix}:",
+            None,
+        )
+    ]
+    append = props.append  # local_cache_attribute
+
+    if script_type == CNST.PUB_KEY:
+        assert key_hash is not None or key_path  # validate_script
+        if key_hash:
+            append((None, bech32.encode(bech32.HRP_SHARED_KEY_HASH, key_hash)))
+        elif key_path:
+            append((address_n_to_str(key_path), None))
+    elif script_type == CNST.N_OF_K:
+        assert script.required_signatures_count is not None  # validate_script
+        append(
+            (
+                f"Requires {script.required_signatures_count} out of {len(scripts)} signatures.",
+                None,
+            )
+        )
+    elif script_type == CNST.INVALID_BEFORE:
+        assert script.invalid_before is not None  # validate_script
+        append((str(script.invalid_before), None))
+    elif script_type == CNST.INVALID_HEREAFTER:
+        assert script.invalid_hereafter is not None  # validate_script
+        append((str(script.invalid_hereafter), None))
+
+    if script_type in (
+        CNST.ALL,
+        CNST.ANY,
+        CNST.N_OF_K,
+    ):
+        assert scripts  # validate_script
+        append((f"Contains {len(scripts)} nested scripts.", None))
+
+    await confirm_properties(
+        "verify_script",
+        "Verify script",
+        props,
+        br_code=BRT_Other,
+    )
+
+    for i, sub_script in enumerate(scripts):
+        await show_native_script(sub_script, indices + [i + 1])
+
+
+async def show_script_hash(
+    script_hash: bytes,
+    display_format: CardanoNativeScriptHashDisplayFormat,
+) -> None:
+    from trezor.enums import CardanoNativeScriptHashDisplayFormat
+
+    assert display_format in (
+        CardanoNativeScriptHashDisplayFormat.BECH32,
+        CardanoNativeScriptHashDisplayFormat.POLICY_ID,
+    )
+
+    if display_format == CardanoNativeScriptHashDisplayFormat.BECH32:
+        await confirm_properties(
+            "verify_script",
+            "Verify script",
+            (("Script hash:", bech32.encode(bech32.HRP_SCRIPT_HASH, script_hash)),),
+            br_code=BRT_Other,
+        )
+    elif display_format == CardanoNativeScriptHashDisplayFormat.POLICY_ID:
+        await layouts.confirm_blob(
+            "verify_script",
+            "Verify script",
+            script_hash,
+            "Policy ID:",
+            br_code=BRT_Other,
+        )
+
+
+async def show_tx_init(title: str) -> bool:
+    should_show_details = await layouts.should_show_more(
+        "Confirm transaction",
+        (
+            (
+                ui.DEMIBOLD,
+                title,
+            ),
+            (ui.NORMAL, "Choose level of details:"),
+        ),
+        "Show All",
+        confirm="Show Simple",
+    )
+
+    return should_show_details
+
+
+async def confirm_input(input: messages.CardanoTxInput) -> None:
+    await confirm_properties(
+        "confirm_input",
+        "Confirm transaction",
+        (
+            ("Input ID:", input.prev_hash),
+            ("Input index:", str(input.prev_index)),
+        ),
+        br_code=BRT_Other,
+    )
 
 
 async def confirm_sending(
-    ctx: wire.Context,
     ada_amount: int,
-    token_bundle: list[CardanoAssetGroupType],
     to: str,
+    output_type: Literal["address", "change", "collateral-return"],
+    network_id: int,
+    chunkify: bool,
 ) -> None:
-    await confirm_sending_token_bundle(ctx, token_bundle)
+    if output_type == "address":
+        title = "Sending"
+    elif output_type == "change":
+        title = "Change output"
+    elif output_type == "collateral-return":
+        title = "Collateral return"
+    else:
+        raise RuntimeError  # should be unreachable
 
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Confirm sending:")
-    page1.bold(format_coin_amount(ada_amount))
-    page1.normal("to")
-
-    pages = _paginate_text(
-        page1,
-        "Confirm transaction",
-        ui.ICON_SEND,
+    await layouts.confirm_output(
         to,
-        lines_per_page=4,
-        lines_used_on_first_page=3,
+        format_coin_amount(ada_amount, network_id),
+        title,
+        br_code=ButtonRequestType.Other,
+        chunkify=chunkify,
     )
 
-    await require_confirm(ctx, Paginated(pages))
 
+async def confirm_sending_token(policy_id: bytes, token: messages.CardanoToken) -> None:
+    assert token.amount is not None  # _validate_token
 
-async def confirm_sending_token_bundle(
-    ctx: wire.Context, token_bundle: list[CardanoAssetGroupType]
-) -> None:
-    for token_group in token_bundle:
-        for token in token_group.tokens:
-            page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-            page1.normal("Asset fingerprint:")
-            page1.bold(
+    await confirm_properties(
+        "confirm_token",
+        "Confirm transaction",
+        (
+            (
+                "Asset fingerprint:",
                 format_asset_fingerprint(
-                    policy_id=token_group.policy_id,
+                    policy_id=policy_id,
                     asset_name_bytes=token.asset_name_bytes,
-                )
-            )
-            page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-            page2.normal("Amount sent:")
-            page2.bold(format_amount(token.amount, 0))
-            await require_confirm(ctx, Paginated([page1, page2]))
-
-
-async def show_warning_tx_output_contains_tokens(ctx: wire.Context) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("The following")
-    page1.normal("transaction output")
-    page1.normal("contains tokens.")
-    page1.br_half()
-    page1.normal("Continue?")
-
-    await require_confirm(ctx, page1)
-
-
-async def show_warning_path(ctx: wire.Context, path: list[int], title: str) -> None:
-    page1 = Text("Confirm path", ui.ICON_WRONG, ui.RED)
-    page1.normal(title)
-    page1.bold(address_n_to_str(path))
-    page1.normal("is unknown.")
-    page1.normal("Are you sure?")
-    await require_confirm(ctx, page1)
-
-
-async def show_warning_tx_no_staking_info(
-    ctx: wire.Context, address_type: EnumTypeCardanoAddressType, amount: int
-) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Change " + ADDRESS_TYPE_NAMES[address_type].lower())
-    page1.normal("address has no stake")
-    page1.normal("rights.")
-    page1.normal("Change amount:")
-    page1.bold(format_coin_amount(amount))
-
-    await require_confirm(ctx, page1)
-
-
-async def show_warning_tx_pointer_address(
-    ctx: wire.Context,
-    pointer: CardanoBlockchainPointerType,
-    amount: int,
-) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Change address has a")
-    page1.normal("pointer with staking")
-    page1.normal("rights.")
-
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Pointer:")
-    page2.bold(
-        "%s, %s, %s"
-        % (pointer.block_index, pointer.tx_index, pointer.certificate_index)
+                ),
+            ),
+            ("Amount sent:", format_amount(token.amount, 0)),
+        ),
+        br_code=BRT_Other,
     )
-    page2.normal("Change amount:")
-    page2.bold(format_coin_amount(amount))
-
-    await require_confirm(ctx, Paginated([page1, page2]))
 
 
-async def show_warning_tx_different_staking_account(
-    ctx: wire.Context,
-    staking_account_path: list[int],
-    amount: int,
+async def confirm_datum_hash(datum_hash: bytes) -> None:
+    await confirm_properties(
+        "confirm_datum_hash",
+        "Confirm transaction",
+        (
+            (
+                "Datum hash:",
+                bech32.encode(bech32.HRP_OUTPUT_DATUM_HASH, datum_hash),
+            ),
+        ),
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_inline_datum(first_chunk: bytes, inline_datum_size: int) -> None:
+    await _confirm_data_chunk(
+        "confirm_inline_datum",
+        "Inline datum",
+        first_chunk,
+        inline_datum_size,
+    )
+
+
+async def confirm_reference_script(
+    first_chunk: bytes, reference_script_size: int
 ) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Change address staking")
-    page1.normal("rights do not match")
-    page1.normal("the current account.")
-
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Staking account %s:" % format_account_number(staking_account_path))
-    page2.bold(address_n_to_str(staking_account_path))
-    page2.normal("Change amount:")
-    page2.bold(format_coin_amount(amount))
-
-    await require_confirm(ctx, Paginated([page1, page2]))
+    await _confirm_data_chunk(
+        "confirm_reference_script",
+        "Reference script",
+        first_chunk,
+        reference_script_size,
+    )
 
 
-async def show_warning_tx_staking_key_hash(
-    ctx: wire.Context,
-    staking_key_hash: bytes,
-    amount: int,
+async def _confirm_data_chunk(
+    br_type: str, title: str, first_chunk: bytes, data_size: int
 ) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Change address staking")
-    page1.normal("rights do not match")
-    page1.normal("the current account.")
+    MAX_DISPLAYED_SIZE = 56
+    displayed_bytes = first_chunk[:MAX_DISPLAYED_SIZE]
+    bytes_optional_plural = "byte" if data_size == 1 else "bytes"
+    props: list[tuple[str, bytes | None]] = [
+        (
+            f"{title} ({data_size} {bytes_optional_plural}):",
+            displayed_bytes,
+        )
+    ]
+    if data_size > MAX_DISPLAYED_SIZE:
+        props.append(("...", None))
+    await confirm_properties(
+        br_type,
+        title="Confirm transaction",
+        props=props,
+        br_code=BRT_Other,
+    )
 
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Staking key hash:")
-    page2.mono(*chunks(hexlify(staking_key_hash).decode(), 17))
 
-    page3 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page3.normal("Change amount:")
-    page3.bold(format_coin_amount(amount))
+async def show_credentials(
+    payment_credential: Credential,
+    stake_credential: Credential,
+) -> None:
+    intro_text = "Address"
+    await _show_credential(payment_credential, intro_text, purpose="address")
+    await _show_credential(stake_credential, intro_text, purpose="address")
 
-    await require_confirm(ctx, Paginated([page1, page2, page3]))
+
+async def show_change_output_credentials(
+    payment_credential: Credential,
+    stake_credential: Credential,
+) -> None:
+    intro_text = "The following address is a change address. Its"
+    await _show_credential(payment_credential, intro_text, purpose="output")
+    await _show_credential(stake_credential, intro_text, purpose="output")
 
 
-async def confirm_transaction(
-    ctx: wire.Context,
-    amount: int,
+async def show_device_owned_output_credentials(
+    payment_credential: Credential,
+    stake_credential: Credential,
+    show_both_credentials: bool,
+) -> None:
+    intro_text = "The following address is owned by this device. Its"
+    await _show_credential(payment_credential, intro_text, purpose="output")
+    if show_both_credentials:
+        await _show_credential(stake_credential, intro_text, purpose="output")
+
+
+async def show_cvote_registration_payment_credentials(
+    payment_credential: Credential,
+    stake_credential: Credential,
+    show_both_credentials: bool,
+    show_payment_warning: bool,
+) -> None:
+    intro_text = (
+        "The vote key registration payment address is owned by this device. Its"
+    )
+    await _show_credential(
+        payment_credential, intro_text, purpose="cvote_reg_payment_address"
+    )
+    if show_both_credentials or show_payment_warning:
+        extra_text = CVOTE_REWARD_ELIGIBILITY_WARNING if show_payment_warning else None
+        await _show_credential(
+            stake_credential,
+            intro_text,
+            purpose="cvote_reg_payment_address",
+            extra_text=extra_text,
+        )
+
+
+async def _show_credential(
+    credential: Credential,
+    intro_text: str,
+    purpose: Literal["address", "output", "cvote_reg_payment_address"],
+    extra_text: str | None = None,
+) -> None:
+    title = {
+        "address": f"{ADDRESS_TYPE_NAMES[credential.address_type]} address",
+        "output": "Confirm transaction",
+        "cvote_reg_payment_address": "Confirm transaction",
+    }[purpose]
+
+    props: list[PropertyType] = []
+    append = props.append  # local_cache_attribute
+
+    # Credential can be empty in case of enterprise address stake credential
+    # and reward address payment credential. In that case we don't want to
+    # show some of the "props".
+    if credential.is_set():
+        credential_title = credential.get_title()
+        append(
+            (
+                f"{intro_text} {credential.type_name} credential is a {credential_title}:",
+                None,
+            )
+        )
+        props.extend(credential.format())
+
+    if credential.is_unusual_path:
+        append((None, "Path is unusual."))
+    if credential.is_mismatch:
+        append((None, "Credential doesn't match payment credential."))
+    if credential.is_reward and purpose != "cvote_reg_payment_address":
+        # for cvote registrations, this is handled by extra_text at the end
+        append(("Address is a reward address.", None))
+    if credential.is_no_staking:
+        append(
+            (
+                f"{ADDRESS_TYPE_NAMES[credential.address_type]} address - no staking rewards.",
+                None,
+            )
+        )
+
+    if extra_text:
+        append((extra_text, None))
+
+    if len(props) > 0:
+        await confirm_properties(
+            "confirm_credential",
+            title,
+            props,
+            br_code=BRT_Other,
+        )
+
+
+async def warn_path(path: list[int], title: str) -> None:
+    await layouts.confirm_path_warning(address_n_to_str(path), path_type=title)
+
+
+async def warn_tx_output_contains_tokens(is_collateral_return: bool = False) -> None:
+    content = (
+        "The collateral return output contains tokens."
+        if is_collateral_return
+        else "The following transaction output contains tokens."
+    )
+    await confirm_metadata(
+        "confirm_tokens",
+        "Confirm transaction",
+        content,
+        br_code=BRT_Other,
+    )
+
+
+async def warn_tx_contains_mint() -> None:
+    await confirm_metadata(
+        "confirm_tokens",
+        "Confirm transaction",
+        "The transaction contains minting or burning of tokens.",
+        br_code=BRT_Other,
+    )
+
+
+async def warn_tx_output_no_datum() -> None:
+    await confirm_metadata(
+        "confirm_no_datum_hash",
+        "Confirm transaction",
+        "The following transaction output contains a script address, but does not contain a datum.",
+        br_code=BRT_Other,
+    )
+
+
+async def warn_no_script_data_hash() -> None:
+    await confirm_metadata(
+        "confirm_no_script_data_hash",
+        "Confirm transaction",
+        "The transaction contains no script data hash. Plutus script will not be able to run.",
+        br_code=BRT_Other,
+    )
+
+
+async def warn_no_collateral_inputs() -> None:
+    await confirm_metadata(
+        "confirm_no_collateral_inputs",
+        "Confirm transaction",
+        "The transaction contains no collateral inputs. Plutus script will not be able to run.",
+        br_code=BRT_Other,
+    )
+
+
+async def warn_unknown_total_collateral() -> None:
+    await layouts.show_warning(
+        "confirm_unknown_total_collateral",
+        "Unknown collateral amount.",
+        "Check all items carefully.",
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_witness_request(
+    witness_path: list[int],
+) -> None:
+    from . import seed
+
+    if seed.is_multisig_path(witness_path):
+        path_title = "multi-sig path"
+    elif seed.is_minting_path(witness_path):
+        path_title = "token minting path"
+    else:
+        path_title = "path"
+
+    await layouts.confirm_text(
+        "confirm_total",
+        "Confirm transaction",
+        address_n_to_str(witness_path),
+        f"Sign transaction with {path_title}:",
+        BRT_Other,
+    )
+
+
+async def confirm_tx(
     fee: int,
+    network_id: int,
     protocol_magic: int,
     ttl: int | None,
     validity_interval_start: int | None,
+    total_collateral: int | None,
     is_network_id_verifiable: bool,
+    tx_hash: bytes | None,
 ) -> None:
-    pages: list[ui.Component] = []
+    props: list[PropertyType] = [
+        ("Transaction fee:", format_coin_amount(fee, network_id)),
+    ]
+    append = props.append  # local_cache_attribute
 
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Transaction amount:")
-    page1.bold(format_coin_amount(amount))
-    page1.normal("Transaction fee:")
-    page1.bold(format_coin_amount(fee))
-    pages.append(page1)
+    if total_collateral is not None:
+        append(("Total collateral:", format_coin_amount(total_collateral, network_id)))
 
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
     if is_network_id_verifiable:
-        page2.normal("Network:")
-        page2.bold(protocol_magics.to_ui_string(protocol_magic))
-    page2.normal("Valid since: %s" % format_optional_int(validity_interval_start))
-    page2.normal("TTL: %s" % format_optional_int(ttl))
-    pages.append(page2)
+        append((f"Network: {protocol_magics.to_ui_string(protocol_magic)}", None))
 
-    await require_hold_to_confirm(ctx, Paginated(pages))
+    append((f"Valid since: {format_optional_int(validity_interval_start)}", None))
+    append((f"TTL: {format_optional_int(ttl)}", None))
+
+    if tx_hash:
+        append(("Transaction ID:", tx_hash))
+
+    await confirm_properties(
+        "confirm_total",
+        "Confirm transaction",
+        props,
+        hold=True,
+        br_code=BRT_Other,
+    )
 
 
-async def confirm_certificate(
-    ctx: wire.Context, certificate: CardanoTxCertificateType
-) -> None:
+async def confirm_certificate(certificate: messages.CardanoTxCertificate) -> None:
     # stake pool registration requires custom confirmation logic not covered
     # in this call
     assert certificate.type != CardanoCertificateType.STAKE_POOL_REGISTRATION
 
-    pages: list[ui.Component] = []
-
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Confirm:")
-    page1.bold(CERTIFICATE_TYPE_NAMES[certificate.type])
-    page1.normal("for account %s:" % format_account_number(certificate.path))
-    page1.bold(address_n_to_str(to_account_path(certificate.path)))
-    pages.append(page1)
+    props: list[PropertyType] = [
+        ("Confirm:", CERTIFICATE_TYPE_NAMES[certificate.type]),
+        _format_stake_credential(
+            certificate.path, certificate.script_hash, certificate.key_hash
+        ),
+    ]
 
     if certificate.type == CardanoCertificateType.STAKE_DELEGATION:
         assert certificate.pool is not None  # validate_certificate
-        page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-        page2.normal("to pool:")
-        page2.bold(format_stake_pool_id(certificate.pool))
-        pages.append(page2)
+        props.append(("to pool:", format_stake_pool_id(certificate.pool)))
 
-    await require_confirm(ctx, Paginated(pages))
+    await confirm_properties(
+        "confirm_certificate",
+        "Confirm transaction",
+        props,
+        br_code=BRT_Other,
+    )
 
 
 async def confirm_stake_pool_parameters(
-    ctx: wire.Context,
-    pool_parameters: CardanoPoolParametersType,
+    pool_parameters: messages.CardanoPoolParametersType,
     network_id: int,
-    protocol_magic: int,
 ) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.bold("Stake pool registration")
-    page1.normal("Pool ID:")
-    page1.bold(format_stake_pool_id(pool_parameters.pool_id))
-
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Pool reward account:")
-    page2.bold(pool_parameters.reward_account)
-
-    page3 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page3.normal("Pledge: " + format_coin_amount(pool_parameters.pledge))
-    page3.normal("Cost: " + format_coin_amount(pool_parameters.cost))
     margin_percentage = (
         100.0 * pool_parameters.margin_numerator / pool_parameters.margin_denominator
     )
-    percentage_formatted = ("%f" % margin_percentage).rstrip("0").rstrip(".")
-    page3.normal("Margin: %s%%" % percentage_formatted)
+    percentage_formatted = str(float(margin_percentage)).rstrip("0").rstrip(".")
+    await confirm_properties(
+        "confirm_pool_registration",
+        "Confirm transaction",
+        (
+            (
+                "Stake pool registration\nPool ID:",
+                format_stake_pool_id(pool_parameters.pool_id),
+            ),
+            ("Pool reward account:", pool_parameters.reward_account),
+            (
+                f"Pledge: {format_coin_amount(pool_parameters.pledge, network_id)}\n"
+                + f"Cost: {format_coin_amount(pool_parameters.cost, network_id)}\n"
+                + f"Margin: {percentage_formatted}%",
+                None,
+            ),
+        ),
+        br_code=BRT_Other,
+    )
 
-    await require_confirm(ctx, Paginated([page1, page2, page3]))
 
-
-async def confirm_stake_pool_owners(
-    ctx: wire.Context,
-    keychain: seed.Keychain,
-    owners: list[CardanoPoolOwnerType],
+async def confirm_stake_pool_owner(
+    keychain: Keychain,
+    owner: messages.CardanoPoolOwner,
+    protocol_magic: int,
     network_id: int,
 ) -> None:
-    pages: list[ui.Component] = []
-    for index, owner in enumerate(owners, 1):
-        page = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-        page.normal("Pool owner #%d:" % (index))
+    from trezor import messages
 
-        if owner.staking_key_path:
-            page.bold(address_n_to_str(owner.staking_key_path))
-            page.normal(
-                encode_human_readable_address(
-                    pack_reward_address_bytes(
-                        get_public_key_hash(keychain, owner.staking_key_path),
-                        network_id,
-                    )
-                )
+    props: list[tuple[str, str | None]] = []
+    if owner.staking_key_path:
+        props.append(("Pool owner:", address_n_to_str(owner.staking_key_path)))
+        props.append(
+            (
+                addresses.derive_human_readable(
+                    keychain,
+                    messages.CardanoAddressParametersType(
+                        address_type=CardanoAddressType.REWARD,
+                        address_n=owner.staking_key_path,
+                    ),
+                    protocol_magic,
+                    network_id,
+                ),
+                None,
             )
-        else:
-            assert owner.staking_key_hash is not None  # validate_pool_owners
-            page.bold(
-                encode_human_readable_address(
-                    pack_reward_address_bytes(owner.staking_key_hash, network_id)
-                )
+        )
+    else:
+        assert owner.staking_key_hash is not None  # validate_pool_owners
+        props.append(
+            (
+                "Pool owner:",
+                addresses.derive_human_readable(
+                    keychain,
+                    messages.CardanoAddressParametersType(
+                        address_type=CardanoAddressType.REWARD,
+                        staking_key_hash=owner.staking_key_hash,
+                    ),
+                    protocol_magic,
+                    network_id,
+                ),
             )
+        )
 
-        pages.append(page)
-
-    await require_confirm(ctx, Paginated(pages))
+    await confirm_properties(
+        "confirm_pool_owners",
+        "Confirm transaction",
+        props,
+        br_code=BRT_Other,
+    )
 
 
 async def confirm_stake_pool_metadata(
-    ctx: wire.Context,
-    metadata: CardanoPoolMetadataType | None,
+    metadata: messages.CardanoPoolMetadataType | None,
 ) -> None:
-
     if metadata is None:
-        page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-        page1.normal("Pool has no metadata")
-        page1.normal("(anonymous pool)")
-
-        await require_confirm(ctx, page1)
+        await confirm_properties(
+            "confirm_pool_metadata",
+            "Confirm transaction",
+            (("Pool has no metadata (anonymous pool)", None),),
+            br_code=BRT_Other,
+        )
         return
 
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Pool metadata url:")
-    page1.bold(metadata.url)
+    await confirm_properties(
+        "confirm_pool_metadata",
+        "Confirm transaction",
+        (
+            ("Pool metadata url:", metadata.url),
+            ("Pool metadata hash:", metadata.hash),
+        ),
+        br_code=BRT_Other,
+    )
 
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Pool metadata hash:")
-    page2.bold(hexlify(metadata.hash).decode())
 
-    await require_confirm(ctx, Paginated([page1, page2]))
-
-
-async def confirm_transaction_network_ttl(
-    ctx: wire.Context,
+async def confirm_stake_pool_registration_final(
     protocol_magic: int,
     ttl: int | None,
     validity_interval_start: int | None,
 ) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Network:")
-    page1.bold(protocol_magics.to_ui_string(protocol_magic))
-    page1.normal("Valid since: %s" % format_optional_int(validity_interval_start))
-    page1.normal("TTL: %s" % format_optional_int(ttl))
-
-    await require_confirm(ctx, page1)
-
-
-async def confirm_stake_pool_registration_final(
-    ctx: wire.Context,
-) -> None:
-
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Confirm signing the stake pool registration as an owner")
-
-    await require_hold_to_confirm(ctx, page1)
+    await confirm_properties(
+        "confirm_pool_final",
+        "Confirm transaction",
+        (
+            ("Confirm signing the stake pool registration as an owner.", None),
+            ("Network:", protocol_magics.to_ui_string(protocol_magic)),
+            ("Valid since:", format_optional_int(validity_interval_start)),
+            ("TTL:", format_optional_int(ttl)),
+        ),
+        hold=True,
+        br_code=BRT_Other,
+    )
 
 
 async def confirm_withdrawal(
-    ctx: wire.Context, withdrawal: CardanoTxWithdrawalType
+    withdrawal: messages.CardanoTxWithdrawal,
+    address_bytes: bytes,
+    network_id: int,
 ) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Confirm withdrawal")
-    page1.normal("for account %s:" % format_account_number(withdrawal.path))
-    page1.bold(address_n_to_str(to_account_path(withdrawal.path)))
-    page1.normal("Amount:")
-    page1.bold(format_coin_amount(withdrawal.amount))
+    address_type_name = "script reward" if withdrawal.script_hash else "reward"
+    address = addresses.encode_human_readable(address_bytes)
+    props: list[PropertyType] = [
+        (f"Confirm withdrawal for {address_type_name} address:", address),
+    ]
 
-    await require_confirm(ctx, page1)
+    if withdrawal.path:
+        props.append(
+            _format_stake_credential(
+                withdrawal.path, withdrawal.script_hash, withdrawal.key_hash
+            )
+        )
 
+    props.append(("Amount:", format_coin_amount(withdrawal.amount, network_id)))
 
-async def confirm_catalyst_registration(
-    ctx: wire.Context,
-    public_key: str,
-    staking_path: list[int],
-    reward_address: str,
-    nonce: int,
-) -> None:
-    pages: list[ui.Component] = []
-
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.bold("Catalyst voting key")
-    page1.bold("registration")
-    pages.append(page1)
-
-    page2 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page2.normal("Voting public key:")
-    page2.bold(*chunks(public_key, 17))
-    pages.append(page2)
-
-    page3 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page3.normal("Staking key for")
-    page3.normal("account %s:" % format_account_number(staking_path))
-    page3.bold(address_n_to_str(staking_path))
-    pages.append(page3)
-
-    page4 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page4.normal("Rewards go to:")
-
-    pages.extend(
-        _paginate_text(page4, "Confirm transaction", ui.ICON_SEND, reward_address)
-    )
-
-    last_page = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    last_page.normal("Nonce: %s" % nonce)
-    pages.append(last_page)
-
-    await require_confirm(ctx, Paginated(pages))
-
-
-async def show_auxiliary_data_hash(
-    ctx: wire.Context, auxiliary_data_hash: bytes
-) -> None:
-    page1 = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Auxiliary data hash:")
-    page1.bold(hexlify(auxiliary_data_hash).decode())
-
-    await require_confirm(ctx, page1)
-
-
-async def show_address(
-    ctx: wire.Context,
-    address: str,
-    address_type: EnumTypeCardanoAddressType,
-    path: list[int],
-    network: str | None = None,
-) -> bool:
-    """
-    Custom show_address function is needed because cardano addresses don't
-    fit on a single screen.
-    """
-
-    address_type_label = "%s address" % ADDRESS_TYPE_NAMES[address_type]
-    page1 = Text(address_type_label, ui.ICON_RECEIVE, ui.GREEN)
-
-    lines_per_page = 5
-    lines_used_on_first_page = 0
-
-    # assemble first page to be displayed (path + network + whatever part of the address fits)
-    if network is not None:
-        page1.normal("%s network" % network)
-        lines_used_on_first_page += 1
-
-    path_str = address_n_to_str(path)
-    page1.mono(path_str)
-    lines_used_on_first_page = min(
-        lines_used_on_first_page + math.ceil(len(path_str) / _MAX_MONO_LINE),
-        lines_per_page,
-    )
-
-    pages = _paginate_text(
-        page1,
-        address_type_label,
-        ui.ICON_RECEIVE,
-        address,
-        lines_per_page=lines_per_page,
-        lines_used_on_first_page=lines_used_on_first_page,
-    )
-
-    return await confirm(
-        ctx,
-        Paginated(pages),
-        code=ButtonRequestType.Address,
-        cancel="QR",
-        cancel_style=ButtonDefault,
+    await confirm_properties(
+        "confirm_withdrawal",
+        "Confirm transaction",
+        props,
+        br_code=BRT_Other,
     )
 
 
-def _paginate_text(
-    first_page: Text,
-    page_desc: str,
-    page_icon: str,
-    text: str,
-    lines_per_page: int = 5,
-    lines_used_on_first_page: int = 1,
-) -> list[ui.Component]:
-    lines = list(chunks(text, 17))
+def _format_stake_credential(
+    path: list[int], script_hash: bytes | None, key_hash: bytes | None
+) -> tuple[str, str]:
+    from .helpers.utils import to_account_path
 
-    offset = lines_per_page - lines_used_on_first_page
-
-    for text_line in lines[:offset]:
-        first_page.bold(text_line)
-
-    pages: list[ui.Component] = [first_page]
-    if len(lines) > offset:
-        to_pages = list(chunks(lines[offset:], lines_per_page))
-        for page in to_pages:
-            t = Text(page_desc, page_icon, ui.GREEN)
-            for line in page:
-                t.bold(line)
-            pages.append(t)
-
-    return pages
-
-
-async def show_warning_address_foreign_staking_key(
-    ctx: wire.Context,
-    account_path: list[int],
-    staking_account_path: list[int],
-    staking_key_hash: bytes | None,
-) -> None:
-    page1 = Text("Warning", ui.ICON_WRONG, ui.RED)
-    page1.normal("Stake rights associated")
-    page1.normal("with this address do")
-    page1.normal("not match your")
-    page1.normal("account %s:" % format_account_number(account_path))
-    page1.bold(address_n_to_str(account_path))
-
-    page2 = Text("Warning", ui.ICON_WRONG, ui.RED)
-    if staking_account_path:
-        page2.normal("Stake account %s:" % format_account_number(staking_account_path))
-        page2.bold(address_n_to_str(staking_account_path))
-        page2.br_half()
+    if path:
+        return (
+            f"for account {format_account_number(path)}:",
+            address_n_to_str(to_account_path(path)),
+        )
+    elif key_hash:
+        return ("for key hash:", bech32.encode(bech32.HRP_STAKE_KEY_HASH, key_hash))
+    elif script_hash:
+        return ("for script:", bech32.encode(bech32.HRP_SCRIPT_HASH, script_hash))
     else:
-        assert staking_key_hash is not None  # _validate_base_address_staking_info
-        page2.normal("Staking key:")
-        page2.bold(hexlify(staking_key_hash).decode())
-    page2.normal("Continue?")
-
-    await require_confirm(ctx, Paginated([page1, page2]))
+        # should be unreachable unless there's a bug in validation
+        raise ValueError
 
 
-async def show_warning_tx_network_unverifiable(ctx: wire.Context) -> None:
-    page1 = Text("Warning", ui.ICON_SEND, ui.GREEN)
-    page1.normal("Transaction has no outputs, network cannot be verified.")
-    page1.br_half()
-    page1.normal("Continue?")
-
-    await require_confirm(ctx, page1)
-
-
-async def show_warning_address_pointer(
-    ctx: wire.Context, pointer: CardanoBlockchainPointerType
+async def confirm_cvote_registration_delegation(
+    public_key: str,
+    weight: int,
 ) -> None:
-    text = Text("Warning", ui.ICON_WRONG, ui.RED)
-    text.normal("Pointer address:")
-    text.normal("Block: %s" % pointer.block_index)
-    text.normal("Transaction: %s" % pointer.tx_index)
-    text.normal("Certificate: %s" % pointer.certificate_index)
-    text.normal("Continue?")
-    await require_confirm(ctx, text)
+    props: list[PropertyType] = [
+        ("Vote key registration (CIP-36)", None),
+        ("Delegating to:", public_key),
+    ]
+    if weight is not None:
+        props.append(("Weight:", str(weight)))
+
+    await confirm_properties(
+        "confirm_cvote_registration_delegation",
+        title="Confirm transaction",
+        props=props,
+        br_code=ButtonRequestType.Other,
+    )
+
+
+async def confirm_cvote_registration_payment_address(
+    payment_address: str,
+    should_show_payment_warning: bool,
+) -> None:
+    props = [
+        ("Vote key registration (CIP-36)", None),
+        ("Rewards go to:", payment_address),
+    ]
+    if should_show_payment_warning:
+        props.append((CVOTE_REWARD_ELIGIBILITY_WARNING, None))
+    await confirm_properties(
+        "confirm_cvote_registration_payment_address",
+        title="Confirm transaction",
+        props=props,
+        br_code=ButtonRequestType.Other,
+    )
+
+
+async def confirm_cvote_registration(
+    vote_public_key: str | None,
+    staking_path: list[int],
+    nonce: int,
+    voting_purpose: int | None,
+) -> None:
+    props: list[PropertyType] = [("Vote key registration (CIP-36)", None)]
+    if vote_public_key is not None:
+        props.append(("Vote public key:", vote_public_key))
+    props.extend(
+        [
+            (
+                f"Staking key for account {format_account_number(staking_path)}:",
+                address_n_to_str(staking_path),
+            ),
+            ("Nonce:", str(nonce)),
+        ]
+    )
+    if voting_purpose is not None:
+        props.append(
+            (
+                "Voting purpose:",
+                "Catalyst" if voting_purpose == 0 else f"{voting_purpose} (other)",
+            )
+        )
+
+    await confirm_properties(
+        "confirm_cvote_registration",
+        title="Confirm transaction",
+        props=props,
+        br_code=ButtonRequestType.Other,
+    )
+
+
+async def show_auxiliary_data_hash(auxiliary_data_hash: bytes) -> None:
+    await confirm_properties(
+        "confirm_auxiliary_data",
+        "Confirm transaction",
+        (("Auxiliary data hash:", auxiliary_data_hash),),
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_token_minting(policy_id: bytes, token: messages.CardanoToken) -> None:
+    assert token.mint_amount is not None  # _validate_token
+    await confirm_properties(
+        "confirm_mint",
+        "Confirm transaction",
+        (
+            (
+                "Asset fingerprint:",
+                format_asset_fingerprint(
+                    policy_id,
+                    token.asset_name_bytes,
+                ),
+            ),
+            (
+                "Amount minted:" if token.mint_amount >= 0 else "Amount burned:",
+                format_amount(token.mint_amount, 0),
+            ),
+        ),
+        br_code=BRT_Other,
+    )
+
+
+async def warn_tx_network_unverifiable() -> None:
+    await confirm_metadata(
+        "warning_no_outputs",
+        "Warning",
+        "Transaction has no outputs, network cannot be verified.",
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_script_data_hash(script_data_hash: bytes) -> None:
+    await confirm_properties(
+        "confirm_script_data_hash",
+        "Confirm transaction",
+        (
+            (
+                "Script data hash:",
+                bech32.encode(bech32.HRP_SCRIPT_DATA_HASH, script_data_hash),
+            ),
+        ),
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_collateral_input(
+    collateral_input: messages.CardanoTxCollateralInput,
+) -> None:
+    await confirm_properties(
+        "confirm_collateral_input",
+        "Confirm transaction",
+        (
+            ("Collateral input ID:", collateral_input.prev_hash),
+            ("Collateral input index:", str(collateral_input.prev_index)),
+        ),
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_reference_input(
+    reference_input: messages.CardanoTxReferenceInput,
+) -> None:
+    await confirm_properties(
+        "confirm_reference_input",
+        "Confirm transaction",
+        (
+            ("Reference input ID:", reference_input.prev_hash),
+            ("Reference input index:", str(reference_input.prev_index)),
+        ),
+        br_code=BRT_Other,
+    )
+
+
+async def confirm_required_signer(
+    required_signer: messages.CardanoTxRequiredSigner,
+) -> None:
+    assert (
+        required_signer.key_hash is not None or required_signer.key_path
+    )  # _validate_required_signer
+    formatted_signer = (
+        bech32.encode(bech32.HRP_REQUIRED_SIGNER_KEY_HASH, required_signer.key_hash)
+        if required_signer.key_hash is not None
+        else address_n_to_str(required_signer.key_path)
+    )
+
+    await confirm_properties(
+        "confirm_required_signer",
+        "Confirm transaction",
+        (("Required signer", formatted_signer),),
+        br_code=BRT_Other,
+    )
+
+
+async def show_cardano_address(
+    address_parameters: messages.CardanoAddressParametersType,
+    address: str,
+    protocol_magic: int,
+    chunkify: bool,
+) -> None:
+    CAT = CardanoAddressType  # local_cache_global
+
+    network_name = None
+    if not protocol_magics.is_mainnet(protocol_magic):
+        network_name = protocol_magics.to_ui_string(protocol_magic)
+
+    path = None
+    account = ADDRESS_TYPE_NAMES[address_parameters.address_type]
+    if address_parameters.address_type in (
+        CAT.BYRON,
+        CAT.BASE,
+        CAT.BASE_KEY_SCRIPT,
+        CAT.POINTER,
+        CAT.ENTERPRISE,
+        CAT.REWARD,
+    ):
+        if address_parameters.address_n:
+            path = address_n_to_str(address_parameters.address_n)
+        elif address_parameters.address_n_staking:
+            path = address_n_to_str(address_parameters.address_n_staking)
+
+    await layouts.show_address(
+        address,
+        path=path,
+        account=account,
+        network=network_name,
+        chunkify=chunkify,
+    )

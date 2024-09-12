@@ -24,7 +24,6 @@ from trezorlib import (
     ethereum,
     fido,
     firmware,
-    lisk,
     misc,
     monero,
     nem,
@@ -52,7 +51,6 @@ MODULES = (
     ethereum,
     fido,
     firmware,
-    lisk,
     misc,
     monero,
     nem,
@@ -128,7 +126,7 @@ def send_clicks(dest):
             echo("Please wait...")
 
             if key == "confirm":
-                output = "debug.input(button=True)"
+                output = "debug.input(button=messages.DebugButton.YES)"
                 DEBUGLINK.press_yes()
             elif key in "uj":
                 output = "debug.input(swipe=messages.DebugSwipeDirection.UP)"

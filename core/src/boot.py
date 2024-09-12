@@ -1,15 +1,35 @@
+# isort:skip_file
+
+import trezorui2
+
+# Showing welcome screen as soon as possible
+# (display is also prepared on that occasion).
+# Remembering time to control how long we show it.
+trezorui2.draw_welcome_screen()
+
 import storage
 import storage.device
-import storage.sd_salt
 from trezor import config, log, loop, ui, utils, wire
-from trezor.pin import show_pin_timeout
+from trezor.pin import (
+    allow_all_loader_messages,
+    ignore_nonpin_loader_messages,
+    show_pin_timeout,
+)
+from trezor.ui.layouts.homescreen import Lockscreen
 
 from apps.common.request_pin import can_lock_device, verify_user_pin
-from apps.homescreen.lockscreen import Lockscreen
 
 
 async def bootscreen() -> None:
-    lockscreen = Lockscreen(bootscreen=True)
+    """Sequence of actions to be done on boot (after device is connected).
+
+    We are starting with welcome_screen on the screen and want to show it
+    for at least _WELCOME_SCREEN_MS before any other screen.
+
+    Any non-PIN loaders are ignored during this function.
+    Allowing all of them before returning.
+    """
+    lockscreen = Lockscreen(label=storage.device.get_label(), bootscreen=True)
     ui.display.orientation(storage.device.get_rotation())
     while True:
         try:
@@ -17,6 +37,7 @@ async def bootscreen() -> None:
                 await lockscreen
             await verify_user_pin()
             storage.init_unlocked()
+            allow_all_loader_messages()
             return
         except wire.PinCancelled:
             # verify_user_pin will convert a SdCardUnavailable (in case of sd salt)
@@ -30,8 +51,9 @@ async def bootscreen() -> None:
             utils.halt(e.__class__.__name__)
 
 
-ui.display.backlight(ui.BACKLIGHT_NONE)
-ui.backlight_fade(ui.BACKLIGHT_NORMAL)
+# Ignoring all non-PIN messages in the boot-phase (turned off in `bootscreen()`).
+ignore_nonpin_loader_messages()
+
 config.init(show_pin_timeout)
 
 if __debug__ and not utils.EMULATOR:

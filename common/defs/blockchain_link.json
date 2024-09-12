@@ -75,22 +75,10 @@
       "https://explorer.fujicoin.org"
     ]
   },
-  "bitcoin:GAME": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.gamecredits.network"
-    ]
-  },
   "bitcoin:GRS": {
     "type": "blockbook",
     "url": [
       "https://blockbook.groestlcoin.org"
-    ]
-  },
-  "bitcoin:KOTO": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.kotocoin.info"
     ]
   },
   "bitcoin:LTC": {
@@ -109,12 +97,6 @@
       "https://blockbook.electrum-mona.org"
     ]
   },
-  "bitcoin:MUE": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.monetaryunit.org"
-    ]
-  },
   "bitcoin:NMC": {
     "type": "blockbook",
     "url": [
@@ -126,12 +108,6 @@
     "type": "blockbook",
     "url": [
       "https://blockbook.pivx.link"
-    ]
-  },
-  "bitcoin:POLIS": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.polispay.org"
     ]
   },
   "bitcoin:PPC": {
@@ -155,7 +131,7 @@
   "bitcoin:SYS": {
     "type": "blockbook",
     "url": [
-      "https://sys1.bcfn.ca"
+      "https://blockbook.elint.services"
     ]
   },
   "bitcoin:TEST": {
@@ -163,13 +139,6 @@
     "url": [
       "https://tbtc1.trezor.io",
       "https://tbtc2.trezor.io"
-    ]
-  },
-  "bitcoin:UNO": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.flurbo.xyz",
-      "https://blockbook.unobtanium.uno"
     ]
   },
   "bitcoin:VIPS": {
@@ -186,19 +155,6 @@
       "https://vtc3.trezor.io",
       "https://vtc4.trezor.io",
       "https://vtc5.trezor.io"
-    ]
-  },
-  "bitcoin:XRC": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook1.bitcoinrh.org",
-      "https://blockbook2.bitcoinrh.org"
-    ]
-  },
-  "bitcoin:ZCR": {
-    "type": "blockbook",
-    "url": [
-      "https://blockbook.zcore.cash"
     ]
   },
   "bitcoin:ZEC": {
@@ -249,7 +205,7 @@
       "https://eth2.trezor.io"
     ]
   },
-  "eth:ROP": {
+  "eth:tROP": {
     "type": "blockbook",
     "url": [
       "https://ropsten1.trezor.io",
@@ -268,6 +224,18 @@
     "type": "ripple",
     "url": [
       "wss://s.altnet.rippletest.net"
+    ]
+  },
+  "misc:ADA": {
+    "type": "blockfrost",
+    "url": [
+      "wss://trezor-cardano-mainnet.blockfrost.io"
+    ]
+  },
+  "misc:tADA": {
+    "type": "blockfrost",
+    "url": [
+      "wss://trezor-cardano-preview.blockfrost.io"
     ]
   }
 }

@@ -1,9 +1,12 @@
 <%
-ATTRIBUTES = (
-	("name", c_str),
-	("ticker", lambda s: c_str(" " + s) if s else "NULL"),
+ATTRIBUTES_REQUIRED = (
 	("namespace", c_str),
 	("mosaic", c_str),
+)
+
+ATTRIBUTES_OPTIONAL = (
+	("name", c_str),
+	("ticker", lambda s: c_str(" " + s) if s else "NULL"),
 	("divisibility", int),
 	("levy", lambda s: "NEMMosaicLevy_" + s),
 	("fee", int),
@@ -17,9 +20,15 @@ ATTRIBUTES = (
 #include "nem_mosaics.h"
 
 const NEMMosaicDefinition NEM_MOSAIC_DEFINITIONS[NEM_MOSAIC_DEFINITIONS_COUNT] = {
-% for m in supported_on("trezor1", nem):
+% for m in supported_on("T1B1", nem):
 {
-	% for attr, func in ATTRIBUTES:
+	% for attr, func in ATTRIBUTES_REQUIRED:
+		% if attr in m:
+	.${attr} = ${func(m[attr])},
+		% endif
+	% endfor
+	.description = "",
+	% for attr, func in ATTRIBUTES_OPTIONAL:
 		% if attr in m:
 	.has_${attr} = true,
 	.${attr} = ${func(m[attr])},

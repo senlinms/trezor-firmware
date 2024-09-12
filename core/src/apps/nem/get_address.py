@@ -1,33 +1,44 @@
-from trezor.messages.NEMAddress import NEMAddress
-from trezor.ui.layouts import show_address
+from typing import TYPE_CHECKING
 
 from apps.common.keychain import with_slip44_keychain
-from apps.common.layout import address_n_to_str
-from apps.common.paths import validate_path
 
 from . import CURVE, PATTERNS, SLIP44_ID
-from .helpers import check_path, get_network_str
-from .validators import validate_network
+
+if TYPE_CHECKING:
+    from trezor.messages import NEMAddress, NEMGetAddress
+
+    from apps.common.keychain import Keychain
 
 
 @with_slip44_keychain(*PATTERNS, slip44_id=SLIP44_ID, curve=CURVE)
-async def get_address(ctx, msg, keychain):
-    network = validate_network(msg.network)
-    await validate_path(
-        ctx, keychain, msg.address_n, check_path(msg.address_n, msg.network)
-    )
+async def get_address(msg: NEMGetAddress, keychain: Keychain) -> NEMAddress:
+    from trezor.messages import NEMAddress
+    from trezor.ui.layouts import show_address
 
-    node = keychain.derive(msg.address_n)
+    from apps.common import paths
+
+    from .helpers import check_path, get_network_str
+    from .validators import validate_network
+
+    address_n = msg.address_n  # local_cache_attribute
+    network = msg.network  # local_cache_attribute
+
+    validate_network(network)
+    await paths.validate_path(keychain, address_n, check_path(address_n, network))
+
+    node = keychain.derive(address_n)
     address = node.nem_address(network)
 
     if msg.show_display:
-        desc = address_n_to_str(msg.address_n)
+        from . import PATTERNS, SLIP44_ID
+
         await show_address(
-            ctx,
-            address=address,
-            address_qr=address.upper(),
-            desc=desc,
+            address,
+            case_sensitive=False,
+            path=paths.address_n_to_str(address_n),
+            account=paths.get_account_name("NEM", msg.address_n, PATTERNS, SLIP44_ID),
             network=get_network_str(network),
+            chunkify=bool(msg.chunkify),
         )
 
     return NEMAddress(address=address)

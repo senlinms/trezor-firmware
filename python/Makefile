@@ -2,8 +2,7 @@ PYTHON=python3
 SETUP=$(PYTHON) setup.py
 
 EXCLUDES=.vscode
-STYLE_TARGETS=src/trezorlib setup.py
-EXCLUDE_TARGETS=messages
+STYLE_TARGETS=src tests tools helper-scripts setup.py
 
 all: build
 
@@ -18,7 +17,6 @@ dist: doc clean
 	$(SETUP) bdist_wheel
 
 doc:
-	make -C .. changelog
 	$(PYTHON) helper-scripts/make-options-rst.py
 
 clean: clean-build clean-pyc clean-test ## remove all build, test, coverage and Python artifacts
@@ -47,13 +45,25 @@ git-clean:
 
 style:
 	black $(STYLE_TARGETS)
-	isort --apply --recursive $(STYLE_TARGETS) --skip-glob "$(EXCLUDE_TARGETS)/*"
-	autoflake -i --remove-all-unused-imports -r $(STYLE_TARGETS) --exclude "$(EXCLUDE_TARGETS)"
+	isort $(STYLE_TARGETS)
+	autoflake -i --remove-all-unused-imports -r $(STYLE_TARGETS)
 	flake8
+	make pyright
 
 style_check:
 	black --check $(STYLE_TARGETS)
-	isort --check-only --recursive $(STYLE_TARGETS) --skip-glob "$(EXCLUDE_TARGETS)/*"
+	isort --check-only $(STYLE_TARGETS)
 	flake8
+	make pyright
+
+style_quick_check:
+	black --check $(STYLE_TARGETS)
+	isort --check-only $(STYLE_TARGETS)
 
 .PHONY: all build install clean style style_check git-clean clean-build clean-pyc clean-test
+
+test:
+	pytest tests
+
+pyright:
+	python ./../tools/pyright_tool.py

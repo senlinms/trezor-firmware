@@ -25,6 +25,7 @@
 
 #if MICROPY_PY_TREZORUI
 
+#include "embed/extmod/trezorobj.h"
 #include "modtrezorui-display.h"
 
 STATIC const mp_rom_map_elem_t mp_module_trezorui_globals_table[] = {
@@ -40,6 +41,6 @@ const mp_obj_module_t mp_module_trezorui = {
     .globals = (mp_obj_dict_t*)&mp_module_trezorui_globals,
 };
 
-MP_REGISTER_MODULE(MP_QSTR_trezorui, mp_module_trezorui, MICROPY_PY_TREZORUI);
+MP_REGISTER_MODULE(MP_QSTR_trezorui, mp_module_trezorui);
 
 #endif  // MICROPY_PY_TREZORUI

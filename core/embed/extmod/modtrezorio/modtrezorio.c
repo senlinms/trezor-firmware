@@ -27,8 +27,13 @@
 
 #include <unistd.h>
 
+#include TREZOR_BOARD
+#include "button.h"
 #include "touch.h"
 #include "usb.h"
+
+// Whether USB data pins were connected on last check (USB configured)
+bool usb_connected_previously = true;
 
 #define CHECK_PARAM_RANGE(value, minimum, maximum)  \
   if (value < minimum || value > maximum) {         \
@@ -36,18 +41,23 @@
   }
 
 // clang-format off
-#include "modtrezorio-fatfs.h"
 #include "modtrezorio-flash.h"
 #include "modtrezorio-hid.h"
 #include "modtrezorio-poll.h"
-#include "modtrezorio-sbu.h"
-#include "modtrezorio-sdcard.h"
 #include "modtrezorio-vcp.h"
 #include "modtrezorio-webusb.h"
 #include "modtrezorio-usb.h"
 // clang-format on
+#ifdef USE_SBU
+#include "modtrezorio-sbu.h"
+#endif
+#ifdef USE_SD_CARD
+#include "modtrezorio-fatfs.h"
+#include "modtrezorio-sdcard.h"
+#endif
 
 /// package: trezorio.__init__
+/// from . import fatfs, sdcard
 
 /// POLL_READ: int  # wait until interface is readable and return read data
 /// POLL_WRITE: int  # wait until interface is writable
@@ -57,21 +67,45 @@
 /// TOUCH_MOVE: int  # event id of touch move event
 /// TOUCH_END: int  # event id of touch end event
 
-/// WireInterface = Union[HID, WebUSB]
+/// BUTTON: int  # interface id of button events
+/// BUTTON_PRESSED: int  # button down event
+/// BUTTON_RELEASED: int  # button up event
+/// BUTTON_LEFT: int  # button number of left button
+/// BUTTON_RIGHT: int  # button number of right button
 
-/// if False:
-///     from . import fatfs, sdcard
+/// USB_CHECK: int # interface id for check of USB data connection
+
+/// WireInterface = Union[HID, WebUSB]
 
 STATIC const mp_rom_map_elem_t mp_module_trezorio_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_trezorio)},
 
+#ifdef USE_SBU
+    {MP_ROM_QSTR(MP_QSTR_SBU), MP_ROM_PTR(&mod_trezorio_SBU_type)},
+#endif
+
+#ifdef USE_SD_CARD
     {MP_ROM_QSTR(MP_QSTR_fatfs), MP_ROM_PTR(&mod_trezorio_fatfs_module)},
+    {MP_ROM_QSTR(MP_QSTR_sdcard), MP_ROM_PTR(&mod_trezorio_sdcard_module)},
+#endif
+
+#ifdef USE_TOUCH
+    {MP_ROM_QSTR(MP_QSTR_TOUCH), MP_ROM_INT(TOUCH_IFACE)},
+    {MP_ROM_QSTR(MP_QSTR_TOUCH_START), MP_ROM_INT((TOUCH_START >> 24) & 0xFFU)},
+    {MP_ROM_QSTR(MP_QSTR_TOUCH_MOVE), MP_ROM_INT((TOUCH_MOVE >> 24) & 0xFFU)},
+    {MP_ROM_QSTR(MP_QSTR_TOUCH_END), MP_ROM_INT((TOUCH_END >> 24) & 0xFFU)},
+#endif
+#ifdef USE_BUTTON
+    {MP_ROM_QSTR(MP_QSTR_BUTTON), MP_ROM_INT(BUTTON_IFACE)},
+    {MP_ROM_QSTR(MP_QSTR_BUTTON_PRESSED),
+     MP_ROM_INT((BTN_EVT_DOWN >> 24) & 0x3U)},
+    {MP_ROM_QSTR(MP_QSTR_BUTTON_RELEASED),
+     MP_ROM_INT((BTN_EVT_UP >> 24) & 0x3U)},
+    {MP_ROM_QSTR(MP_QSTR_BUTTON_LEFT), MP_ROM_INT(BTN_LEFT)},
+    {MP_ROM_QSTR(MP_QSTR_BUTTON_RIGHT), MP_ROM_INT(BTN_RIGHT)},
+#endif
 
     {MP_ROM_QSTR(MP_QSTR_FlashOTP), MP_ROM_PTR(&mod_trezorio_FlashOTP_type)},
-
-    {MP_ROM_QSTR(MP_QSTR_SBU), MP_ROM_PTR(&mod_trezorio_SBU_type)},
-
-    {MP_ROM_QSTR(MP_QSTR_sdcard), MP_ROM_PTR(&mod_trezorio_sdcard_module)},
 
     {MP_ROM_QSTR(MP_QSTR_USB), MP_ROM_PTR(&mod_trezorio_USB_type)},
     {MP_ROM_QSTR(MP_QSTR_HID), MP_ROM_PTR(&mod_trezorio_HID_type)},
@@ -82,10 +116,7 @@ STATIC const mp_rom_map_elem_t mp_module_trezorio_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_POLL_READ), MP_ROM_INT(POLL_READ)},
     {MP_ROM_QSTR(MP_QSTR_POLL_WRITE), MP_ROM_INT(POLL_WRITE)},
 
-    {MP_ROM_QSTR(MP_QSTR_TOUCH), MP_ROM_INT(TOUCH_IFACE)},
-    {MP_ROM_QSTR(MP_QSTR_TOUCH_START), MP_ROM_INT((TOUCH_START >> 24) & 0xFFU)},
-    {MP_ROM_QSTR(MP_QSTR_TOUCH_MOVE), MP_ROM_INT((TOUCH_MOVE >> 24) & 0xFFU)},
-    {MP_ROM_QSTR(MP_QSTR_TOUCH_END), MP_ROM_INT((TOUCH_END >> 24) & 0xFFU)},
+    {MP_ROM_QSTR(MP_QSTR_USB_CHECK), MP_ROM_INT(USB_DATA_IFACE)},
 };
 
 STATIC MP_DEFINE_CONST_DICT(mp_module_trezorio_globals,
@@ -96,6 +127,6 @@ const mp_obj_module_t mp_module_trezorio = {
     .globals = (mp_obj_dict_t*)&mp_module_trezorio_globals,
 };
 
-MP_REGISTER_MODULE(MP_QSTR_trezorio, mp_module_trezorio, MICROPY_PY_TREZORIO);
+MP_REGISTER_MODULE(MP_QSTR_trezorio, mp_module_trezorio);
 
 #endif  // MICROPY_PY_TREZORIO

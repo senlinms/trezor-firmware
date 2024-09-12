@@ -23,6 +23,7 @@
 #include "bip32.h"
 #include "buttons.h"
 #include "config.h"
+#include "crypto.h"
 #include "curves.h"
 #include "debug.h"
 #include "gettext.h"
@@ -240,7 +241,7 @@ void u2fhid_read_start(const U2FHID_FRAME *f) {
         break;
     }
 
-    // wait for next commmand/ button press
+    // wait for next command/button press
     reader->cmd = 0;
     reader->seq = 255;
     while (dialog_timeout > 0 && reader->cmd == 0) {
@@ -481,7 +482,7 @@ static const HDNode *generateKeyHandle(const uint8_t app_id[],
   uint32_t key_path[KEY_PATH_ENTRIES] = {0};
   for (uint32_t i = 0; i < KEY_PATH_ENTRIES; i++) {
     // high bit for hardened keys
-    key_path[i] = 0x80000000 | random32();
+    key_path[i] = PATH_HARDENED | random32();
   }
 
   // First half of keyhandle is key_path
@@ -508,7 +509,7 @@ static const HDNode *validateKeyHandle(const uint8_t app_id[],
   memcpy(key_path, key_handle, KEY_PATH_LEN);
   for (unsigned int i = 0; i < KEY_PATH_ENTRIES; i++) {
     // check high bit for hardened keys
-    if (!(key_path[i] & 0x80000000)) {
+    if (!(key_path[i] & PATH_HARDENED)) {
       return NULL;
     }
   }
@@ -604,8 +605,11 @@ void u2f_register(const APDU *a) {
       return;
     }
 
-    ecdsa_get_public_key65(node->curve->params, node->private_key,
-                           (uint8_t *)&resp->pubKey);
+    if (ecdsa_get_public_key65(node->curve->params, node->private_key,
+                               (uint8_t *)&resp->pubKey) != 0) {
+      send_u2f_error(U2F_SW_WRONG_DATA);
+      return;
+    }
 
     memcpy(resp->keyHandleCertSig + resp->keyHandleLen, U2F_ATT_CERT,
            sizeof(U2F_ATT_CERT));
@@ -644,7 +648,7 @@ void u2f_register(const APDU *a) {
     return;
   }
 
-  // Didnt expect to get here
+  // Didn't expect to get here
   dialog_timeout = 0;
 }
 

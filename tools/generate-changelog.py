@@ -8,7 +8,7 @@ import subprocess
 import click
 
 LINK_RE = re.compile(r"\[#(\d+)\]")
-ISSUE_URL = "https://github.com/trezor/trezor-firmware/issues/{issue}"
+ISSUE_URL = "https://github.com/trezor/trezor-firmware/pull/{issue}"
 
 VERSION_HEADER_RE = re.compile(r"## \[([.0-9]+)\]")
 DIFF_LINK = "[{new}]: https://github.com/trezor/trezor-firmware/compare/{tag_prefix}{old}...{tag_prefix}{new}\n"
@@ -79,13 +79,19 @@ def current_date(project):
     parts = project.parts
     today = datetime.datetime.now()
 
-    if parts[-2:] == ("legacy", "bootloader"):
+    if (
+        parts[-3:] == ("core", "embed", "boardloader")
+        or parts[-3:] == ("core", "embed", "bootloader")
+        or parts[-3:] == ("core", "embed", "bootloader_ci")
+        or parts[-2:] == ("legacy", "bootloader")
+        or parts[-2:] == ("legacy", "intermediate_fw")
+    ):
         return today.strftime("%B %Y")
     elif parts[-1] == "python":
         return today.strftime("%Y-%m-%d")
     else:
         daysuffix = {1: "st", 2: "nd", 3: "rd"}.get(today.day % 10, "th")
-        return today.strftime(f"%d{daysuffix} %B %Y")
+        return today.strftime(f"%-d{daysuffix} %B %Y")
 
 
 @click.command()
@@ -117,7 +123,7 @@ def cli(project, version, date, check):
     changelog = project / "CHANGELOG.md"
 
     if not changelog.exists():
-        raise click.ClickException("{} not found".format(changelog))
+        raise click.ClickException(f"{changelog} not found")
 
     if version is None:
         if not check:

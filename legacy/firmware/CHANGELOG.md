@@ -4,7 +4,179 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## 1.10.0 [13rd May 2021]
+## 1.12.1 [15th March 2023]
+
+### Added
+- Support Ledger Live legacy derivation path `m/44'/coin_type'/0'/account`.  [#1749]
+- Show fee rate when replacing transaction.  [#2442]
+- T1 bootloader: verify firmware signatures based on SignMessage, add signature debugging.  [#2568]
+- Allow proposed Casa m/45' multisig paths for Bitcoin and Ethereum.  [#2682]
+- Implement SLIP-0025 coinjoin accounts.  [#2718]
+- Implement `serialize` option in SignTx.  [#2718]
+- Support native SegWit external inputs with non-ownership proof.  [#2718]
+- Implement SLIP-0019 proofs of ownership for native SegWit.  [#2718]
+- Implement coinjoin signing.  [#2718]
+
+### Changed
+- Do not convert bech32 addresses to uppercase in QR code to increase compatibility.  [#2190]
+- Extend decimals of fee rate to 2 digits.  [#2486]
+- Display only sat instead of sat BTC.  [#2487]
+- Increase `SignIdentity.challenge_hidden` max_size to 512 bytes.  [#2743]
+- Included bootloader 1.12.1.
+
+### Fixed
+- Bootloader VTOR and FW handover fix.
+- Show full Stellar address and QR code.  [#1453]
+- Wrap long Ethereum fee to next line if it does not fit.  [#2373]
+
+### Security
+- Match and validate script type of change-outputs in Bitcoin signing.
+
+
+## 1.11.2 [17th August 2022]
+
+### Added
+- Show the fee rate on the signing confirmation screen.  [#2249]
+- Show thousands separator when displaying large amounts.  [#2394]
+
+### Changed
+- Updated secp256k1-zkp.  [#2261]
+
+### Removed
+- Remove firmware dumping capability.  [#2433]
+
+### Security
+- Fix potential security issues in recovery workflow.
+- Fix key extraction vulnerability in Cothority Collective Signing (CoSi).
+- Fix nonce bias in CoSi signing.
+
+
+## 1.11.1 [18th May 2022]
+
+### Added
+- Show "signature is valid" dialog when VerifyMessage succeeds.  [#1880]
+- Add extra check for Taproot scripts validity.  [#2077]
+- Support Electrum signatures in VerifyMessage.  [#2100]
+- \[emulator] Added support for `DebugLinkReseedRandom`.  [#2115]
+- Support unverified external inputs.  [#2144]
+- Support Zcash version 5 transaction format.  [#2031]
+- Add firmware hashing functionality.  [#2239]
+
+### Changed
+- Ensure input's script type and path match the scriptPubKey.  [#1018]
+- Included bootloader 1.11.0.
+
+### Removed
+- \[emulator] Removed support for /dev/urandom or custom entropy source.  [#2115]
+- GAME, NIX and POLIS support.  [#2181]
+
+### Fixed
+- Fix domain-only EIP-712 hashes (i.e. when `primaryType`=`EIP712Domain`).  [#2036]
+- Fix legacy technical debt in USB handling (readability and FSM unwanted states).  [#2107]
+
+### Security
+- Strict path validations for altcoins.
+- Fix soft-lock bypass vulnerability.
+- Make Bitcoin path checks as strict as in Trezor T.
+
+### Incompatible changes
+- Trezor will refuse to sign UTXOs that do not match the provided derivation path (e.g., transactions belonging to a different wallet, or synthetic transaction inputs).  [#1018]
+
+
+## 1.10.5 [19th January 2022]
+
+### Added
+- Support for blindly signing EIP-712 data.  [#131]
+
+### Fixed
+- Prevent recursing in handling RebootToBootloader by USB flush.  [#1985]
+
+
+## 1.10.4 [8th December 2021]
+
+### Added
+- Support no_script_type option in SignMessage.  [#1586]
+- Implement pagination in SignMessage and VerifyMessage.  [#1586]
+- Show address confirmation in SignMessage.  [#1586]
+- Support GetAddress for Taproot addresses.  [#1656]
+- Support sending to Taproot addresses.  [#1656]
+- Support spending from Taproot UTXOs.  [#1656]
+- Support for Taproot descriptors.  [#1710]
+- Ethereum: support 64-bit chain IDs.  [#1771]
+- Support for Ethereum EIP-1559 transactions.  [#1834]
+- Stellar: add support for StellarManageBuyOfferOp and StellarPathPaymentStrictSendOp.  [#1838]
+- Add script_pubkey field to TxInput message.  [#1857]
+- Support of BIP-340 Schnorr signatures (using secp256k1-zkp).  [#1897]
+
+### Changed
+- Update QR-code-generator library version.  [#1639]
+- Show warning dialog in SignMessage if a non-standard path is used.  [#1656]
+- Disable previous transaction streaming in Bitcoin if all internal inputs are Taproot.  [#1656]
+- Faster ECDSA signing and verification (using secp256k1-zkp).  [#1897]
+
+### Removed
+- Remove BELL, ZNY support.  [#1872]
+
+### Fixed
+- Remove rest of altcoin logic from bitcoin-only build.  [#1633]
+- Fix incorrect compile-time check of maximum protobuf message size.  [#1854]
+
+### Security
+- Ensure that the user is always warned about non-standard paths.
+- Avoid accidental build with broken stack protector.  [#1642]
+
+### Incompatible changes
+- Timebounds must be set for a Stellar transaction.  [#1755]
+- Ethereum non-EIP-155 cross-chain signing is no longer supported.  [#1794]
+- Stellar: rename StellarManageOfferOp to StellarManageSellOfferOp, StellarPathPaymentOp to StellarPathPaymentStrictReceiveOp and StellarCreatePassiveOfferOp to StellarCreatePassiveSellOfferOp.  [#1838]
+
+
+## 1.10.3 [16th September 2021]
+
+### Added
+- Re-enabled Firo support  [#1767]
+
+### Changed
+- Emulator properly waits for IO without busy loop  [#1743]
+
+### Removed
+- Removed support for Lisk  [#1765]
+
+### Fixed
+- Add new rpId to Binance's FIDO definition.  [#1705]
+
+### Security
+- Stricter protobuf field handling in Stellar.
+
+
+## 1.10.2 [14th July 2021]
+
+### Removed
+- Removed support for Firo  [#1647]
+- Removed support for Hatch  [#1650]
+
+### Fixed
+- Allow non-standard paths used by Unchained Capital, Green Address and Casa.  [#1660]
+
+### Security
+- Ensure that all testnet coins use SLIP-44 coin type 1.
+- Restrict BIP-45 paths to Bitcoin and coins with strong replay protection.
+- Don't show addresses that have an unrecognized path.
+- Disable all testnet coins from accessing Bitcoin paths.
+- Restrict the BIP-32 path ranges of `account`, `change` and `address_index` fields.
+- Fix operation source account encoding in Stellar.
+
+
+## 1.10.1 [9th June 2021]
+
+### Added
+- Safety checks setting in T1.  [#1627]
+
+### Security
+- Fix incorrect empty string handling in BLAKE implementation used by Decred.
+
+
+## 1.10.0 [12th May 2021]
 
 ### Added
 - Public key to ECDHSessionKey.  [#1518]
@@ -364,20 +536,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - Removed all current limits on size of signed transaction.
 
-[#965]: https://github.com/trezor/trezor-firmware/issues/965
-[#1030]: https://github.com/trezor/trezor-firmware/issues/1030
-[#1098]: https://github.com/trezor/trezor-firmware/issues/1098
-[#1105]: https://github.com/trezor/trezor-firmware/issues/1105
+[#131]: https://github.com/trezor/trezor-firmware/pull/131
+[#965]: https://github.com/trezor/trezor-firmware/pull/965
+[#1018]: https://github.com/trezor/trezor-firmware/pull/1018
+[#1030]: https://github.com/trezor/trezor-firmware/pull/1030
+[#1098]: https://github.com/trezor/trezor-firmware/pull/1098
+[#1105]: https://github.com/trezor/trezor-firmware/pull/1105
 [#1165]: https://github.com/trezor/trezor-firmware/pull/1165
-[#1167]: https://github.com/trezor/trezor-firmware/issues/1167
-[#1188]: https://github.com/trezor/trezor-firmware/issues/1188
-[#1351]: https://github.com/trezor/trezor-firmware/issues/1351
+[#1167]: https://github.com/trezor/trezor-firmware/pull/1167
+[#1188]: https://github.com/trezor/trezor-firmware/pull/1188
+[#1351]: https://github.com/trezor/trezor-firmware/pull/1351
 [#1363]: https://github.com/trezor/trezor-firmware/pull/1363
-[#1367]: https://github.com/trezor/trezor-firmware/issues/1367
+[#1367]: https://github.com/trezor/trezor-firmware/pull/1367
 [#1369]: https://github.com/trezor/trezor-firmware/pull/1369
 [#1402]: https://github.com/trezor/trezor-firmware/pull/1402
 [#1415]: https://github.com/trezor/trezor-firmware/pull/1415
-[#1461]: https://github.com/trezor/trezor-firmware/issues/1461
-[#1491]: https://github.com/trezor/trezor-firmware/issues/1491
-[#1518]: https://github.com/trezor/trezor-firmware/issues/1518
-[#1549]: https://github.com/trezor/trezor-firmware/issues/1549
+[#1453]: https://github.com/trezor/trezor-firmware/pull/1453
+[#1461]: https://github.com/trezor/trezor-firmware/pull/1461
+[#1491]: https://github.com/trezor/trezor-firmware/pull/1491
+[#1518]: https://github.com/trezor/trezor-firmware/pull/1518
+[#1549]: https://github.com/trezor/trezor-firmware/pull/1549
+[#1586]: https://github.com/trezor/trezor-firmware/pull/1586
+[#1627]: https://github.com/trezor/trezor-firmware/pull/1627
+[#1633]: https://github.com/trezor/trezor-firmware/pull/1633
+[#1639]: https://github.com/trezor/trezor-firmware/pull/1639
+[#1642]: https://github.com/trezor/trezor-firmware/pull/1642
+[#1647]: https://github.com/trezor/trezor-firmware/pull/1647
+[#1650]: https://github.com/trezor/trezor-firmware/pull/1650
+[#1656]: https://github.com/trezor/trezor-firmware/pull/1656
+[#1660]: https://github.com/trezor/trezor-firmware/pull/1660
+[#1705]: https://github.com/trezor/trezor-firmware/pull/1705
+[#1710]: https://github.com/trezor/trezor-firmware/pull/1710
+[#1743]: https://github.com/trezor/trezor-firmware/pull/1743
+[#1749]: https://github.com/trezor/trezor-firmware/pull/1749
+[#1755]: https://github.com/trezor/trezor-firmware/pull/1755
+[#1765]: https://github.com/trezor/trezor-firmware/pull/1765
+[#1767]: https://github.com/trezor/trezor-firmware/pull/1767
+[#1771]: https://github.com/trezor/trezor-firmware/pull/1771
+[#1794]: https://github.com/trezor/trezor-firmware/pull/1794
+[#1834]: https://github.com/trezor/trezor-firmware/pull/1834
+[#1838]: https://github.com/trezor/trezor-firmware/pull/1838
+[#1854]: https://github.com/trezor/trezor-firmware/pull/1854
+[#1857]: https://github.com/trezor/trezor-firmware/pull/1857
+[#1872]: https://github.com/trezor/trezor-firmware/pull/1872
+[#1880]: https://github.com/trezor/trezor-firmware/pull/1880
+[#1897]: https://github.com/trezor/trezor-firmware/pull/1897
+[#1985]: https://github.com/trezor/trezor-firmware/pull/1985
+[#2031]: https://github.com/trezor/trezor-firmware/pull/2031
+[#2036]: https://github.com/trezor/trezor-firmware/pull/2036
+[#2077]: https://github.com/trezor/trezor-firmware/pull/2077
+[#2100]: https://github.com/trezor/trezor-firmware/pull/2100
+[#2107]: https://github.com/trezor/trezor-firmware/pull/2107
+[#2115]: https://github.com/trezor/trezor-firmware/pull/2115
+[#2144]: https://github.com/trezor/trezor-firmware/pull/2144
+[#2181]: https://github.com/trezor/trezor-firmware/pull/2181
+[#2190]: https://github.com/trezor/trezor-firmware/pull/2190
+[#2239]: https://github.com/trezor/trezor-firmware/pull/2239
+[#2249]: https://github.com/trezor/trezor-firmware/pull/2249
+[#2261]: https://github.com/trezor/trezor-firmware/pull/2261
+[#2289]: https://github.com/trezor/trezor-firmware/pull/2289
+[#2373]: https://github.com/trezor/trezor-firmware/pull/2373
+[#2394]: https://github.com/trezor/trezor-firmware/pull/2394
+[#2422]: https://github.com/trezor/trezor-firmware/pull/2422
+[#2433]: https://github.com/trezor/trezor-firmware/pull/2433
+[#2442]: https://github.com/trezor/trezor-firmware/pull/2442
+[#2486]: https://github.com/trezor/trezor-firmware/pull/2486
+[#2487]: https://github.com/trezor/trezor-firmware/pull/2487
+[#2568]: https://github.com/trezor/trezor-firmware/pull/2568
+[#2682]: https://github.com/trezor/trezor-firmware/pull/2682
+[#2718]: https://github.com/trezor/trezor-firmware/pull/2718
+[#2743]: https://github.com/trezor/trezor-firmware/pull/2743

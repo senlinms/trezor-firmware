@@ -14,28 +14,34 @@ encrypted using the private spend key. Here the host sends it back
 in `MoneroGetTxKeyRequest.tx_enc_keys` to be decrypted and yet again encrypted
 using the view key, which the host possess.
 """
+from micropython import const
+from typing import TYPE_CHECKING
 
-from trezor import utils
-from trezor.messages.MoneroGetTxKeyAck import MoneroGetTxKeyAck
-from trezor.messages.MoneroGetTxKeyRequest import MoneroGetTxKeyRequest
-
-from apps.common import paths
 from apps.common.keychain import auto_keychain
-from apps.monero import misc
-from apps.monero.layout import confirms
-from apps.monero.xmr import crypto
-from apps.monero.xmr.crypto import chacha_poly
 
-_GET_TX_KEY_REASON_TX_KEY = 0
-_GET_TX_KEY_REASON_TX_DERIVATION = 1
+_GET_TX_KEY_REASON_TX_DERIVATION = const(1)
+
+if TYPE_CHECKING:
+    from trezor.messages import MoneroGetTxKeyAck, MoneroGetTxKeyRequest
+
+    from apps.common.keychain import Keychain
 
 
 @auto_keychain(__name__)
-async def get_tx_keys(ctx, msg: MoneroGetTxKeyRequest, keychain):
-    await paths.validate_path(ctx, keychain, msg.address_n)
+async def get_tx_keys(
+    msg: MoneroGetTxKeyRequest, keychain: Keychain
+) -> MoneroGetTxKeyAck:
+    from trezor import utils, wire
+    from trezor.messages import MoneroGetTxKeyAck
+
+    from apps.common import paths
+    from apps.monero import layout, misc
+    from apps.monero.xmr import chacha_poly, crypto, crypto_helpers
+
+    await paths.validate_path(keychain, msg.address_n)
 
     do_deriv = msg.reason == _GET_TX_KEY_REASON_TX_DERIVATION
-    await confirms.require_confirm_tx_key(ctx, export_key=not do_deriv)
+    await layout.require_confirm_tx_key(export_key=not do_deriv)
 
     creds = misc.get_creds(keychain, msg.address_n, msg.network_type)
 
@@ -43,21 +49,24 @@ async def get_tx_keys(ctx, msg: MoneroGetTxKeyRequest, keychain):
         creds.spend_key_private,
         msg.tx_prefix_hash,
         msg.salt1,
-        crypto.decodeint(msg.salt2),
+        crypto_helpers.decodeint(msg.salt2),
     )
 
     # the plain_buff first stores the tx_priv_keys as decrypted here
     # and then is used to store the derivations if applicable
     plain_buff = chacha_poly.decrypt_pack(tx_enc_key, msg.tx_enc_keys)
     utils.ensure(len(plain_buff) % 32 == 0, "Tx key buffer has invalid size")
-    del msg.tx_enc_keys
+    msg.tx_enc_keys = b""
 
     # If return only derivations do tx_priv * view_pub
     if do_deriv:
+        if msg.view_public_key is None:
+            raise wire.DataError("Missing view public key")
+
         plain_buff = bytearray(plain_buff)
-        view_pub = crypto.decodepoint(msg.view_public_key)
-        tx_priv = crypto.new_scalar()
-        derivation = crypto.new_point()
+        view_pub = crypto_helpers.decodepoint(msg.view_public_key)
+        tx_priv = crypto.Scalar()
+        derivation = crypto.Point()
         n_keys = len(plain_buff) // 32
         for c in range(n_keys):
             crypto.decodeint_into(tx_priv, plain_buff, 32 * c)

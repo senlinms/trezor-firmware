@@ -2,31 +2,31 @@ from common import *
 
 from trezor.utils import chunks
 from trezor.crypto import bip39
-from trezor.messages.SignTx import SignTx
-from trezor.messages.TxAckInput import TxAckInput
-from trezor.messages.TxAckInputWrapper import TxAckInputWrapper
-from trezor.messages.TxInput import TxInput
-from trezor.messages.TxAckOutput import TxAckOutput
-from trezor.messages.TxAckOutputWrapper import TxAckOutputWrapper
-from trezor.messages.TxOutput import TxOutput
-from trezor.messages.TxAckPrevMeta import TxAckPrevMeta
-from trezor.messages.PrevTx import PrevTx
-from trezor.messages.TxAckPrevInput import TxAckPrevInput
-from trezor.messages.TxAckPrevInputWrapper import TxAckPrevInputWrapper
-from trezor.messages.PrevInput import PrevInput
-from trezor.messages.TxAckPrevOutput import TxAckPrevOutput
-from trezor.messages.TxAckPrevOutputWrapper import TxAckPrevOutputWrapper
-from trezor.messages.PrevOutput import PrevOutput
-from trezor.messages.TxRequest import TxRequest
-from trezor.messages.RequestType import TXINPUT, TXOUTPUT, TXMETA, TXFINISHED
-from trezor.messages.TxRequestDetailsType import TxRequestDetailsType
-from trezor.messages.TxRequestSerializedType import TxRequestSerializedType
-from trezor.messages import AmountUnit
-from trezor.messages import OutputScriptType
+from trezor.messages import SignTx
+from trezor.messages import TxAckInput
+from trezor.messages import TxAckInputWrapper
+from trezor.messages import TxInput
+from trezor.messages import TxAckOutput
+from trezor.messages import TxAckOutputWrapper
+from trezor.messages import TxOutput
+from trezor.messages import TxAckPrevMeta
+from trezor.messages import PrevTx
+from trezor.messages import TxAckPrevInput
+from trezor.messages import TxAckPrevInputWrapper
+from trezor.messages import PrevInput
+from trezor.messages import TxAckPrevOutput
+from trezor.messages import TxAckPrevOutputWrapper
+from trezor.messages import PrevOutput
+from trezor.messages import TxRequest
+from trezor.enums.RequestType import TXINPUT, TXOUTPUT, TXMETA, TXFINISHED
+from trezor.messages import TxRequestDetailsType
+from trezor.messages import TxRequestSerializedType
+from trezor.enums import AmountUnit
+from trezor.enums import OutputScriptType
 
 from apps.common import coins
 from apps.common.keychain import Keychain
-from apps.bitcoin.keychain import get_schemas_for_coin
+from apps.bitcoin.keychain import _get_schemas_for_coin
 from apps.bitcoin.sign_tx import bitcoinlike, helpers
 
 
@@ -61,15 +61,18 @@ class TestSignTx_GRS(unittest.TestCase):
                             address_n=[])
         tx = SignTx(coin_name='Groestlcoin', version=1, lock_time=0, inputs_count=1, outputs_count=1)
 
+        # precomputed tx weight is 768
+        fee_rate = 192 / (768 / 4)
+
         messages = [
             None,
             TxRequest(request_type=TXINPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=EMPTY_SERIALIZED),
             TxAckInput(tx=TxAckInputWrapper(input=inp1)),
             TxRequest(request_type=TXOUTPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=EMPTY_SERIALIZED),
             TxAckOutput(tx=TxAckOutputWrapper(output=out1)),
-            helpers.UiConfirmOutput(out1, coin, AmountUnit.BITCOIN),
+            helpers.UiConfirmOutput(out1, coin, AmountUnit.BITCOIN, 0, False),
             True,
-            helpers.UiConfirmTotal(210016, 192, coin, AmountUnit.BITCOIN),
+            helpers.UiConfirmTotal(210016, 192, fee_rate, coin, AmountUnit.BITCOIN, inp1.address_n[:3]),
             True,
             TxRequest(request_type=TXINPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=EMPTY_SERIALIZED),
             TxAckInput(tx=TxAckInputWrapper(input=inp1)),
@@ -101,7 +104,7 @@ class TestSignTx_GRS(unittest.TestCase):
         ]
 
         seed = bip39.seed(' '.join(['all'] * 12), '')
-        ns = get_schemas_for_coin(coin)
+        ns = _get_schemas_for_coin(coin)
         keychain = Keychain(seed, coin.curve_name, ns)
         signer = bitcoinlike.Bitcoinlike(tx, keychain, coin, None).signer()
         for request, expected_response in chunks(messages, 2):

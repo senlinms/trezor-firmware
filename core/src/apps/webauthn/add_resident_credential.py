@@ -1,36 +1,20 @@
-import storage.device
-from trezor import wire
-from trezor.messages.Success import Success
-from trezor.messages.WebAuthnAddResidentCredential import WebAuthnAddResidentCredential
-from trezor.ui.layouts import show_error_and_raise
+from typing import TYPE_CHECKING
 
-from apps.common.confirm import require_confirm
-
-from .confirm import ConfirmContent, ConfirmInfo
-from .credential import Fido2Credential
-from .resident_credentials import store_resident_credential
+if TYPE_CHECKING:
+    from trezor.messages import Success, WebAuthnAddResidentCredential
 
 
-class ConfirmAddCredential(ConfirmInfo):
-    def __init__(self, cred: Fido2Credential):
-        super().__init__()
-        self._cred = cred
-        self.load_icon(cred.rp_id_hash)
+async def add_resident_credential(msg: WebAuthnAddResidentCredential) -> Success:
+    import storage.device as storage_device
+    from trezor import wire
+    from trezor.messages import Success
+    from trezor.ui.layouts import show_error_and_raise
+    from trezor.ui.layouts.fido import confirm_fido
 
-    def get_header(self) -> str:
-        return "Import credential"
+    from .credential import Fido2Credential
+    from .resident_credentials import store_resident_credential
 
-    def app_name(self) -> str:
-        return self._cred.app_name()
-
-    def account_name(self) -> str | None:
-        return self._cred.account_name()
-
-
-async def add_resident_credential(
-    ctx: wire.Context, msg: WebAuthnAddResidentCredential
-) -> Success:
-    if not storage.device.is_initialized():
+    if not storage_device.is_initialized():
         raise wire.NotInitialized("Device is not initialized")
     if not msg.credential_id:
         raise wire.ProcessError("Missing credential ID parameter.")
@@ -39,16 +23,16 @@ async def add_resident_credential(
         cred = Fido2Credential.from_cred_id(bytes(msg.credential_id), None)
     except Exception:
         await show_error_and_raise(
-            ctx,
             "warning_credential",
-            header="Import credential",
-            button="Close",
-            content="The credential you are trying to import does\nnot belong to this authenticator.",
-            red=True,
+            "The credential you are trying to import does\nnot belong to this authenticator.",
         )
 
-    content = ConfirmContent(ConfirmAddCredential(cred))
-    await require_confirm(ctx, content)
+    await confirm_fido(
+        "Import credential",
+        cred.app_name(),
+        cred.icon_name(),
+        [cred.account_name()],
+    )
 
     if store_resident_credential(cred):
         return Success(message="Credential added")

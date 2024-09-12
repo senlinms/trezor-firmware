@@ -1,3 +1,9 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from trezor.messages import Failure
+
+
 if __debug__:
     import gc
     import micropython
@@ -8,7 +14,7 @@ if __debug__:
     PREV_MEM = gc.mem_free()
     CUR_MES = 0
 
-    def log_trace(x=None):
+    def log_trace(x=None) -> None:
         log.debug(
             __name__,
             "Log trace %s, ... F: %s A: %s, S: %s",
@@ -18,7 +24,7 @@ if __debug__:
             micropython.stack_use(),
         )
 
-    def check_mem(x=""):
+    def check_mem(x: str | int = "") -> None:
         global PREV_MEM, CUR_MES
 
         gc.collect()
@@ -26,43 +32,44 @@ if __debug__:
         diff = PREV_MEM - free
         log.debug(
             __name__,
-            "======= {} {} Diff: {} Free: {} Allocated: {}".format(
-                CUR_MES, x, diff, free, gc.mem_alloc()
-            ),
+            f"======= {CUR_MES} {x} Diff: {diff} Free: {free} Allocated: {gc.mem_alloc()}",
         )
         micropython.mem_info()
         gc.collect()
         CUR_MES += 1
         PREV_MEM = free
 
-    def retit(**kwargs):
-        from trezor.messages.Failure import Failure
+    def retit(**kwargs) -> Failure:
+        from trezor.messages import Failure
 
         return Failure(**kwargs)
 
-    async def diag(ctx, msg, **kwargs):
-        log.debug(__name__, "----diagnostics")
+    async def diag(msg, **kwargs) -> Failure:
+        ins = msg.ins  # local_cache_attribute
+        debug = log.debug  # local_cache_attribute
+
+        debug(__name__, "----diagnostics")
         gc.collect()
 
-        if msg.ins == 0:
+        if ins == 0:
             check_mem(0)
             return retit()
 
-        elif msg.ins == 1:
+        elif ins == 1:
             check_mem(1)
             micropython.mem_info(1)
             return retit()
 
-        elif msg.ins == 2:
-            log.debug(__name__, "_____________________________________________")
-            log.debug(__name__, "_____________________________________________")
-            log.debug(__name__, "_____________________________________________")
+        elif ins == 2:
+            debug(__name__, "_____________________________________________")
+            debug(__name__, "_____________________________________________")
+            debug(__name__, "_____________________________________________")
             return retit()
 
-        elif msg.ins == 3:
+        elif ins == 3:
             pass
 
-        elif msg.ins == 4:
+        elif ins == 4:
             total = 0
             monero = 0
 
@@ -74,7 +81,7 @@ if __debug__:
             log.info(__name__, "Total modules: %s, Monero modules: %s", total, monero)
             return retit()
 
-        elif msg.ins in [5, 6, 7]:
+        elif ins in [5, 6, 7]:
             check_mem()
             from apps.monero.xmr import bulletproof as bp
 
@@ -87,23 +94,23 @@ if __debug__:
             bpi.gc_fnc = gc.collect
             bpi.gc_trace = log_trace
 
-            vals = [crypto.sc_init((1 << 30) - 1 + 16), crypto.sc_init(22222)]
+            vals = [crypto.Scalar((1 << 30) - 1 + 16), crypto.Scalar(22222)]
             masks = [crypto.random_scalar(), crypto.random_scalar()]
             check_mem("BP pre input")
 
-            if msg.ins == 5:
+            if ins == 5:
                 bp_res = bpi.prove_testnet(vals[0], masks[0])
                 check_mem("BP post prove")
                 bpi.verify_testnet(bp_res)
                 check_mem("BP post verify")
 
-            elif msg.ins == 6:
+            elif ins == 6:
                 bp_res = bpi.prove(vals[0], masks[0])
                 check_mem("BP post prove")
                 bpi.verify(bp_res)
                 check_mem("BP post verify")
 
-            elif msg.ins == 7:
+            elif ins == 7:
                 bp_res = bpi.prove_batch(vals, masks)
                 check_mem("BP post prove")
                 bpi.verify(bp_res)

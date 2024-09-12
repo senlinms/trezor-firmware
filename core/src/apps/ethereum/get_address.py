@@ -1,33 +1,45 @@
-from trezor.crypto.curve import secp256k1
-from trezor.crypto.hashlib import sha3_256
-from trezor.messages.EthereumAddress import EthereumAddress
-from trezor.ui.layouts import show_address
+from typing import TYPE_CHECKING
 
-from apps.common import paths
-from apps.common.layout import address_n_to_str
-
-from . import networks
-from .address import address_from_bytes
 from .keychain import PATTERNS_ADDRESS, with_keychain_from_path
+
+if TYPE_CHECKING:
+    from trezor.messages import EthereumAddress, EthereumGetAddress
+
+    from apps.common.keychain import Keychain
+
+    from .definitions import Definitions
 
 
 @with_keychain_from_path(*PATTERNS_ADDRESS)
-async def get_address(ctx, msg, keychain):
-    await paths.validate_path(ctx, keychain, msg.address_n)
+async def get_address(
+    msg: EthereumGetAddress,
+    keychain: Keychain,
+    defs: Definitions,
+) -> EthereumAddress:
+    from trezor.messages import EthereumAddress
+    from trezor.ui.layouts import show_address
 
-    node = keychain.derive(msg.address_n)
-    seckey = node.private_key()
-    public_key = secp256k1.publickey(seckey, False)  # uncompressed
-    address_bytes = sha3_256(public_key[1:], keccak=True).digest()[12:]
+    from apps.common import paths
 
-    if len(msg.address_n) > 1:  # path has slip44 network identifier
-        network = networks.by_slip44(msg.address_n[1] & 0x7FFF_FFFF)
-    else:
-        network = None
-    address = address_from_bytes(address_bytes, network)
+    from .helpers import address_from_bytes
+
+    address_n = msg.address_n  # local_cache_attribute
+
+    await paths.validate_path(keychain, address_n)
+
+    node = keychain.derive(address_n)
+
+    address = address_from_bytes(node.ethereum_pubkeyhash(), defs.network)
 
     if msg.show_display:
-        desc = address_n_to_str(msg.address_n)
-        await show_address(ctx, address=address, address_qr=address, desc=desc)
+        slip44_id = address_n[1]  # it depends on the network (ETH vs ETC...)
+        await show_address(
+            address,
+            path=paths.address_n_to_str(address_n),
+            account=paths.get_account_name(
+                "ETH", address_n, PATTERNS_ADDRESS, slip44_id
+            ),
+            chunkify=bool(msg.chunkify),
+        )
 
     return EthereumAddress(address=address)

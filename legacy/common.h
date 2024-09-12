@@ -33,6 +33,8 @@ __fatal_error(const char *expr, const char *msg, const char *file, int line,
 void __attribute__((noreturn))
 error_shutdown(const char *line1, const char *line2, const char *line3,
                const char *line4);
+void show_wipe_code_screen(void);
+void show_pin_too_many_screen(void);
 
 #define ensure(expr, msg) \
   (((expr) == sectrue)    \
@@ -40,8 +42,6 @@ error_shutdown(const char *line1, const char *line2, const char *line3,
        : __fatal_error(#expr, msg, __FILE__, __LINE__, __func__))
 
 void hal_delay(uint32_t ms);
-
-void wait_random(void);
 
 void drbg_init(void);
 void drbg_reseed(const uint8_t *entropy, size_t len);

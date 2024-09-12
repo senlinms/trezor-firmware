@@ -5,7 +5,11 @@ package hw.trezor.messages.debug;
 option java_package = "com.satoshilabs.trezor.lib.protobuf";
 option java_outer_classname = "TrezorMessageDebug";
 
+option (include_in_bitcoin_only) = true;
+
+import "messages.proto";
 import "messages-common.proto";
+import "messages-management.proto";
 
 /**
  * Request: "Press" the button on the device
@@ -13,7 +17,7 @@ import "messages-common.proto";
  * @next DebugLinkLayout
  */
 message DebugLinkDecision {
-    optional bool yes_no = 1;   // true for "Confirm", false for "Cancel"
+    optional DebugButton button = 1;  // button press
     optional DebugSwipeDirection swipe = 2;  // swipe direction
     optional string input = 3;  // keyboard input
     /**
@@ -26,18 +30,38 @@ message DebugLinkDecision {
         RIGHT = 3;
     }
 
-    optional uint32 x = 4;        // touch X coordinate
-    optional uint32 y = 5;        // touch Y coordinate
-    optional bool wait = 6;       // wait for layout change
-    optional uint32 hold_ms = 7;  // touch hold duration
+    /**
+    * Structure representing button presses
+    */
+    enum DebugButton {
+        NO = 0;
+        YES = 1;
+        INFO = 2;
+    }
+
+    /**
+    * Structure representing model R button presses
+    */
+    // TODO: probably delete the middle_btn as it is not a physical one
+    enum DebugPhysicalButton {
+        LEFT_BTN = 0;
+        MIDDLE_BTN = 1;
+        RIGHT_BTN = 2;
+    }
+
+    optional uint32 x = 4;                             // touch X coordinate
+    optional uint32 y = 5;                             // touch Y coordinate
+    optional bool wait = 6;                            // wait for layout change
+    optional uint32 hold_ms = 7;                       // touch hold duration
+    optional DebugPhysicalButton physical_button = 8;  // physical button press
 }
 
 /**
- * Response: Device text layout
+ * Response: Device text layout as a list of tokens as returned by Rust
  * @end
  */
 message DebugLinkLayout {
-    repeated string lines = 1;
+    repeated string tokens = 1;
 }
 
 /**
@@ -55,7 +79,8 @@ message DebugLinkReseedRandom {
  * @next Success
  */
 message DebugLinkRecordScreen {
-    optional string target_directory = 1;  // empty or missing to stop recording
+    optional string target_directory = 1;           // empty or missing to stop recording
+    optional uint32 refresh_index = 2 [default=0];  // which index to give the screenshots (after emulator restarts)
 }
 
 /**
@@ -78,15 +103,15 @@ message DebugLinkState {
     optional string pin = 2;                                // current PIN, blank if PIN is not set/enabled
     optional string matrix = 3;                             // current PIN matrix
     optional bytes mnemonic_secret = 4;                     // current mnemonic secret
-    optional hw.trezor.messages.common.HDNodeType node = 5; // current BIP-32 node
+    optional common.HDNodeType node = 5; // current BIP-32 node
     optional bool passphrase_protection = 6;                // is node/mnemonic encrypted using passphrase?
     optional string reset_word = 7;                         // word on device display during ResetDevice workflow
     optional bytes reset_entropy = 8;                       // current entropy during ResetDevice workflow
     optional string recovery_fake_word = 9;                 // (fake) word on display during RecoveryDevice workflow
     optional uint32 recovery_word_pos = 10;                 // index of mnemonic word the device is expecting during RecoveryDevice workflow
     optional uint32 reset_word_pos = 11;                    // index of mnemonic word the device is expecting during ResetDevice workflow
-    optional uint32 mnemonic_type = 12;                     // current mnemonic type (BIP-39/SLIP-39)
-    repeated string layout_lines = 13;                      // current layout text
+    optional management.BackupType mnemonic_type = 12;      // current mnemonic type (BIP-39/SLIP-39)
+    repeated string tokens = 13;                            // current layout represented as a list of string tokens
 }
 
 /**
@@ -169,4 +194,13 @@ message DebugLinkEraseSdCard {
 message DebugLinkWatchLayout {
     optional bool watch = 1;  // if true, start watching layout.
                               // if false, stop.
+}
+
+
+/**
+ * Request: Remove all the previous debug event state
+ * @start
+ * @next Success
+ */
+message DebugLinkResetDebugEvents {
 }

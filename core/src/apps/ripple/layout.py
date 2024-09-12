@@ -1,31 +1,28 @@
-from trezor import ui
-from trezor.messages import ButtonRequestType
+from trezor.enums import ButtonRequestType
 from trezor.strings import format_amount
-from trezor.ui.components.tt.text import Text
+from trezor.ui.layouts import confirm_metadata, confirm_total
 
-from apps.common.confirm import require_confirm, require_hold_to_confirm
-from apps.common.layout import split_address
-
-from . import helpers
+from .helpers import DECIMALS
 
 
-async def require_confirm_fee(ctx, fee):
-    text = Text("Confirm fee", ui.ICON_SEND, ui.GREEN)
-    text.normal("Transaction fee:")
-    text.bold(format_amount(fee, helpers.DECIMALS) + " XRP")
-    await require_confirm(ctx, text, ButtonRequestType.ConfirmOutput)
+async def require_confirm_total(total: int, fee: int) -> None:
+    await confirm_total(
+        format_amount(total, DECIMALS) + " XRP",
+        format_amount(fee, DECIMALS) + " XRP",
+    )
 
 
-async def require_confirm_destination_tag(ctx, tag):
-    text = Text("Confirm tag", ui.ICON_SEND, ui.GREEN)
-    text.normal("Destination tag:")
-    text.bold(str(tag))
-    await require_confirm(ctx, text, ButtonRequestType.ConfirmOutput)
+async def require_confirm_destination_tag(tag: int) -> None:
+    await confirm_metadata(
+        "confirm_destination_tag",
+        "Confirm tag",
+        "Destination tag:\n{}",
+        str(tag),
+        ButtonRequestType.ConfirmOutput,
+    )
 
 
-async def require_confirm_tx(ctx, to, value):
-    text = Text("Confirm sending", ui.ICON_SEND, ui.GREEN)
-    text.bold(format_amount(value, helpers.DECIMALS) + " XRP")
-    text.normal("to")
-    text.mono(*split_address(to))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_tx(to: str, value: int, chunkify: bool = False) -> None:
+    from trezor.ui.layouts import confirm_output
+
+    await confirm_output(to, format_amount(value, DECIMALS) + " XRP", chunkify=chunkify)

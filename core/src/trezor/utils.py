@@ -3,15 +3,32 @@ import sys
 from trezorutils import (  # noqa: F401
     BITCOIN_ONLY,
     EMULATOR,
-    GITREV,
+    INTERNAL_MODEL,
     MODEL,
+    MODEL_FULL_NAME,
+    SCM_REVISION,
+    UI_LAYOUT,
+    USE_BACKLIGHT,
+    USE_OPTIGA,
+    USE_SD_CARD,
     VERSION_MAJOR,
     VERSION_MINOR,
     VERSION_PATCH,
+    bootloader_locked,
     consteq,
+    firmware_hash,
+    firmware_vendor,
     halt,
     memcpy,
+    reboot_to_bootloader,
+    unit_btconly,
+    unit_color,
 )
+from typing import TYPE_CHECKING
+
+# Will get replaced by "True" / "False" in the build process
+# However, needs to stay as an exported symbol for the unit tests
+MODEL_IS_T2B1: bool = INTERNAL_MODEL == "T2B1"
 
 DISABLE_ANIMATION = 0
 
@@ -24,29 +41,23 @@ if __debug__:
     else:
         LOG_MEMORY = 0
 
-if False:
-    from typing import (
-        Any,
-        Iterator,
-        Protocol,
-        Union,
-        TypeVar,
-        Sequence,
-        Set,
-    )
+if TYPE_CHECKING:
+    from typing import Any, Iterator, Protocol, Sequence, TypeVar
+
+    from trezor.protobuf import MessageType
 
 
-def unimport_begin() -> Set[str]:
+def unimport_begin() -> set[str]:
     return set(sys.modules)
 
 
-def unimport_end(mods: Set[str], collect: bool = True) -> None:
+def unimport_end(mods: set[str], collect: bool = True) -> None:
     # static check that the size of sys.modules never grows above value of
     # MICROPY_LOADED_MODULES_DICT_SIZE, so that the sys.modules dict is never
     # reallocated at run-time
     assert len(sys.modules) <= 160, "Please bump preallocated size in mpconfigport.h"
 
-    for mod in sys.modules:
+    for mod in sys.modules:  # pylint: disable=consider-using-dict-items
         if mod not in mods:
             # remove reference from sys.modules
             del sys.modules[mod]
@@ -69,7 +80,7 @@ def unimport_end(mods: Set[str], collect: bool = True) -> None:
 
 class unimport:
     def __init__(self) -> None:
-        self.mods: Set[str] | None = None
+        self.mods: set[str] | None = None
 
     def __enter__(self) -> None:
         self.mods = unimport_begin()
@@ -91,9 +102,27 @@ def presize_module(modname: str, size: int) -> None:
     """
     module = sys.modules[modname]
     for i in range(size):
-        setattr(module, "___PRESIZE_MODULE_%d" % i, None)
+        setattr(module, f"___PRESIZE_MODULE_{i}", None)
     for i in range(size):
-        delattr(module, "___PRESIZE_MODULE_%d" % i)
+        delattr(module, f"___PRESIZE_MODULE_{i}")
+
+
+if __debug__:
+
+    def mem_dump(filename: str) -> None:
+        from micropython import mem_info
+
+        print(f"### sysmodules ({len(sys.modules)}):")
+        for mod in sys.modules:
+            print("*", mod)
+        if EMULATOR:
+            from trezorutils import meminfo
+
+            print("### dumping to", filename)
+            meminfo(filename)
+            mem_info()
+        else:
+            mem_info(True)
 
 
 def ensure(cond: bool, msg: str | None = None) -> None:
@@ -104,7 +133,7 @@ def ensure(cond: bool, msg: str | None = None) -> None:
             raise AssertionError(msg)
 
 
-if False:
+if TYPE_CHECKING:
     Chunkable = TypeVar("Chunkable", str, Sequence[Any])
 
 
@@ -113,21 +142,64 @@ def chunks(items: Chunkable, size: int) -> Iterator[Chunkable]:
         yield items[i : i + size]
 
 
-if False:
+if TYPE_CHECKING:
 
     class HashContext(Protocol):
-        def update(self, buf: bytes) -> None:
+        def update(self, __buf: bytes) -> None:
             ...
 
         def digest(self) -> bytes:
             ...
 
-    class Writer(Protocol):
-        def append(self, b: int) -> None:
+    class HashContextInitable(HashContext, Protocol):
+        def __init__(  # pylint: disable=super-init-not-called
+            self, __data: bytes | None = None
+        ) -> None:
             ...
 
-        def extend(self, buf: bytes) -> None:
+    class Writer(Protocol):
+        def append(self, __b: int) -> None:
             ...
+
+        def extend(self, __buf: bytes) -> None:
+            ...
+
+
+if False:  # noqa
+
+    class DebugHashContextWrapper:
+        """
+        Use this wrapper to debug hashing operations. When digest() is called,
+        it will log all of the data that was provided to update().
+
+        Example usage:
+        self.h_prevouts = HashWriter(DebugHashContextWrapper(sha256()))
+        """
+
+        def __init__(self, ctx: HashContext) -> None:
+            self.ctx = ctx
+            self.data = ""
+
+        def update(self, data: bytes) -> None:
+            from ubinascii import hexlify
+
+            self.ctx.update(data)
+            self.data += hexlify(data).decode() + " "
+
+        def digest(self) -> bytes:
+            from ubinascii import hexlify
+
+            from trezor import log
+
+            digest = self.ctx.digest()
+            log.debug(
+                __name__,
+                "%s hash: %s, data: %s",
+                self.ctx.__class__.__name__,
+                hexlify(digest).decode(),
+                self.data,
+            )
+            return digest
 
 
 class HashWriter:
@@ -145,53 +217,22 @@ class HashWriter:
     def write(self, buf: bytes) -> None:  # alias for extend()
         self.ctx.update(buf)
 
-    async def awrite(self, buf: bytes) -> int:  # AsyncWriter interface
-        self.ctx.update(buf)
-        return len(buf)
-
     def get_digest(self) -> bytes:
         return self.ctx.digest()
 
 
-if False:
-    BufferType = Union[bytearray, memoryview]
-
-
-class BufferWriter:
-    """Seekable and writeable view into a buffer."""
-
-    def __init__(self, buffer: BufferType) -> None:
-        self.buffer = buffer
-        self.offset = 0
-
-    def seek(self, offset: int) -> None:
-        """Set current offset to `offset`.
-
-        If negative, set to zero. If longer than the buffer, set to end of buffer.
-        """
-        offset = min(offset, len(self.buffer))
-        offset = max(offset, 0)
-        self.offset = offset
-
-    def write(self, src: bytes) -> int:
-        """Write exactly `len(src)` bytes into buffer, or raise EOFError.
-
-        Returns number of bytes written.
-        """
-        buffer = self.buffer
-        offset = self.offset
-        if len(src) > len(buffer) - offset:
-            raise EOFError
-        nwrite = memcpy(buffer, offset, src, 0)
-        self.offset += nwrite
-        return nwrite
+if TYPE_CHECKING:
+    BufferType = bytearray | memoryview
 
 
 class BufferReader:
     """Seekable and readable view into a buffer."""
 
-    def __init__(self, buffer: bytes) -> None:
-        self.buffer = buffer
+    def __init__(self, buffer: bytes | memoryview) -> None:
+        if isinstance(buffer, memoryview):
+            self.buffer = buffer
+        else:
+            self.buffer = memoryview(buffer)
         self.offset = 0
 
     def seek(self, offset: int) -> None:
@@ -222,7 +263,15 @@ class BufferReader:
         If `length` is unspecified, reads all remaining data.
 
         Note that this method makes a copy of the data. To avoid allocation, use
-        `readinto()`.
+        `readinto()`. To avoid copying use `read_memoryview()`.
+        """
+        return bytes(self.read_memoryview(length))
+
+    def read_memoryview(self, length: int | None = None) -> memoryview:
+        """Read and return a memoryview of exactly `length` bytes, or raise
+        EOFError.
+
+        If `length` is unspecified, reads all remaining data.
         """
         if length is None:
             ret = self.buffer[self.offset :]
@@ -255,31 +304,22 @@ class BufferReader:
         return byte
 
 
-def obj_eq(l: object, r: object) -> bool:
+def obj_eq(self: Any, __o: Any) -> bool:
     """
-    Compares object contents, supports __slots__.
+    Compares object contents.
     """
-    if l.__class__ is not r.__class__:
+    if self.__class__ is not __o.__class__:
         return False
-    if not hasattr(l, "__slots__"):
-        return l.__dict__ == r.__dict__
-    if l.__slots__ is not r.__slots__:
-        return False
-    for slot in l.__slots__:
-        if getattr(l, slot, None) != getattr(r, slot, None):
-            return False
-    return True
+    assert not hasattr(self, "__slots__")
+    return self.__dict__ == __o.__dict__
 
 
-def obj_repr(o: object) -> str:
+def obj_repr(self: Any) -> str:
     """
-    Returns a string representation of object, supports __slots__.
+    Returns a string representation of object.
     """
-    if hasattr(o, "__slots__"):
-        d = {attr: getattr(o, attr, None) for attr in o.__slots__}
-    else:
-        d = o.__dict__
-    return "<%s: %s>" % (o.__class__.__name__, d)
+    assert not hasattr(self, "__slots__")
+    return f"<{self.__class__.__name__}: {self.__dict__}>"
 
 
 def truncate_utf8(string: str, max_bytes: int) -> str:
@@ -313,3 +353,34 @@ def empty_bytearray(preallocate: int) -> bytearray:
     b = bytearray(preallocate)
     b[:] = bytes()
     return b
+
+
+if __debug__:
+
+    def dump_protobuf_lines(msg: MessageType, line_start: str = "") -> Iterator[str]:
+        msg_dict = msg.__dict__
+        if not msg_dict:
+            yield line_start + msg.MESSAGE_NAME + " {}"
+            return
+
+        yield line_start + msg.MESSAGE_NAME + " {"
+        for key, val in msg_dict.items():
+            if type(val) == type(msg):
+                sublines = dump_protobuf_lines(val, line_start=key + ": ")
+                for subline in sublines:
+                    yield "    " + subline
+            elif val and isinstance(val, list) and type(val[0]) == type(msg):
+                # non-empty list of protobuf messages
+                yield f"    {key}: ["
+                for subval in val:
+                    sublines = dump_protobuf_lines(subval)
+                    for subline in sublines:
+                        yield "        " + subline
+                yield "    ]"
+            else:
+                yield f"    {key}: {repr(val)}"
+
+        yield "}"
+
+    def dump_protobuf(msg: MessageType) -> str:
+        return "\n".join(dump_protobuf_lines(msg))

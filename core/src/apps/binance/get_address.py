@@ -1,25 +1,38 @@
-from trezor.messages.BinanceAddress import BinanceAddress
-from trezor.messages.BinanceGetAddress import BinanceGetAddress
-from trezor.ui.layouts import show_address
+from typing import TYPE_CHECKING
 
-from apps.common import paths
-from apps.common.keychain import Keychain, auto_keychain
-from apps.common.layout import address_n_to_str
+from apps.common.keychain import auto_keychain
 
-from .helpers import address_from_public_key
+if TYPE_CHECKING:
+    from trezor.messages import BinanceAddress, BinanceGetAddress
+
+    from apps.common.keychain import Keychain
 
 
 @auto_keychain(__name__)
-async def get_address(ctx, msg: BinanceGetAddress, keychain: Keychain):
+async def get_address(msg: BinanceGetAddress, keychain: Keychain) -> BinanceAddress:
+    from trezor.messages import BinanceAddress
+    from trezor.ui.layouts import show_address
+
+    from apps.common import paths
+
+    from .helpers import address_from_public_key
+
     HRP = "bnb"
+    address_n = msg.address_n  # local_cache_attribute
 
-    await paths.validate_path(ctx, keychain, msg.address_n)
+    await paths.validate_path(keychain, address_n)
 
-    node = keychain.derive(msg.address_n)
+    node = keychain.derive(address_n)
     pubkey = node.public_key()
     address = address_from_public_key(pubkey, HRP)
     if msg.show_display:
-        desc = address_n_to_str(msg.address_n)
-        await show_address(ctx, address=address, address_qr=address, desc=desc)
+        from . import PATTERN, SLIP44_ID
+
+        await show_address(
+            address,
+            path=paths.address_n_to_str(address_n),
+            account=paths.get_account_name("BNB", address_n, PATTERN, SLIP44_ID),
+            chunkify=bool(msg.chunkify),
+        )
 
     return BinanceAddress(address=address)

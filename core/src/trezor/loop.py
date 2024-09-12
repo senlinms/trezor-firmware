@@ -9,19 +9,15 @@ See `schedule`, `run`, and syscalls `sleep`, `wait`, `signal` and `race`.
 
 import utime
 import utimeq
+from typing import TYPE_CHECKING
 
 from trezor import io, log
 
-if False:
-    from typing import (
-        Any,
-        Awaitable,
-        Callable,
-        Coroutine,
-        Generator,
-    )
+if TYPE_CHECKING:
+    from typing import Any, Awaitable, Callable, Coroutine, Generator
 
-    Task = Coroutine
+    Task = Coroutine | Generator
+    AwaitableTask = Task | Awaitable
     Finalizer = Callable[[Task, Any], None]
 
 # function to call after every task step
@@ -38,10 +34,6 @@ _finalizers: dict[int, Finalizer] = {}
 
 # reference to the task that is currently executing
 this_task: Task | None = None
-
-if __debug__:
-    # synthetic event queue
-    synthetic_events: list[tuple[int, Any]] = []
 
 
 class TaskClosed(Exception):
@@ -60,7 +52,7 @@ def schedule(
 ) -> None:
     """
     Schedule task to be executed with `value` on given `deadline` (in
-    microseconds).  Does not start the event loop itself, see `run`.
+    milliseconds).  Does not start the event loop itself, see `run`.
     Usually done in very low-level cases, see `race` for more user-friendly
     and correct concept.
 
@@ -99,7 +91,7 @@ def close(task: Task) -> None:
     Unschedule and unblock a task, close it so it can release all resources, and
     call its finalizer.
     """
-    for iface in _paused:
+    for iface in _paused:  # pylint: disable=consider-using-dict-items
         _paused[iface].discard(task)
     _queue.discard(task)
     task.close()
@@ -116,20 +108,6 @@ def run() -> None:
     task_entry = [0, 0, 0]  # deadline, task, value
     msg_entry = [0, 0]  # iface | flags, value
     while _queue or _paused:
-        if __debug__:
-            # process synthetic events
-            if synthetic_events:
-                iface, event = synthetic_events[0]
-                msg_tasks = _paused.pop(iface, ())
-                if msg_tasks:
-                    synthetic_events.pop(0)
-                    for task in msg_tasks:
-                        _step(task, event)
-
-                    # XXX: we assume that synthetic events are rare. If there is a lot of them,
-                    # this degrades to "while synthetic_events" and would ignore all real ones.
-                    continue
-
         # compute the maximum amount of time we can wait for a message
         if _queue:
             delay = utime.ticks_diff(_queue.peektime(), utime.ticks_ms())
@@ -145,7 +123,7 @@ def run() -> None:
             # timeout occurred, run the first scheduled task
             if _queue:
                 _queue.pop(task_entry)
-                _step(task_entry[1], task_entry[2])  # type: ignore
+                _step(task_entry[1], task_entry[2])  # type: ignore [Argument of type "int" cannot be assigned to parameter "task" of type "Task" in function "_step"]
                 # error: Argument 1 to "_step" has incompatible type "int"; expected "Coroutine[Any, Any, Any]"
                 # rationale: We use untyped lists here, because that is what the C API supports.
 
@@ -208,19 +186,17 @@ class Syscall:
     scheduler, they do so through instances of a class derived from `Syscall`.
     """
 
-    def __iter__(self) -> Task:  # type: ignore
+    def __iter__(self) -> Generator:
         # support `yield from` or `await` on syscalls
         return (yield self)
 
-    def __await__(self) -> Generator:
-        return self.__iter__()  # type: ignore
+    if TYPE_CHECKING:
+
+        def __await__(self) -> Generator:
+            return self.__iter__()
 
     def handle(self, task: Task) -> None:
         pass
-
-
-SLEEP_FOREVER = Syscall()
-"""Tasks awaiting `SLEEP_FOREVER` will never be resumed."""
 
 
 class sleep(Syscall):
@@ -231,7 +207,7 @@ class sleep(Syscall):
     Example:
 
     >>> planned = await loop.sleep(1000)  # sleep for 1s
-    >>> print('missed by %d ms', utime.ticks_diff(utime.ticks_ms(), planned))
+    >>> print(f"missed by {utime.ticks_diff(utime.ticks_ms(), planned)} ms")
     """
 
     def __init__(self, delay_ms: int) -> None:
@@ -261,7 +237,7 @@ class wait(Syscall):
         pause(task, self.msg_iface)
 
 
-_type_gen = type((lambda: (yield))())
+_type_gen: type[Generator] = type((lambda: (yield))())
 
 
 class race(Syscall):
@@ -290,10 +266,10 @@ class race(Syscall):
     `race.__iter__` for explanation.  Always use `await`.
     """
 
-    def __init__(self, *children: Awaitable, exit_others: bool = True) -> None:
+    def __init__(self, *children: AwaitableTask, exit_others: bool = True) -> None:
         self.children = children
         self.exit_others = exit_others
-        self.finished: list[Awaitable] = []  # children that finished
+        self.finished: list[AwaitableTask] = []  # children that finished
         self.scheduled: list[Task] = []  # scheduled wrapper tasks
 
     def handle(self, task: Task) -> None:
@@ -309,13 +285,19 @@ class race(Syscall):
         finished.clear()
 
         for child in self.children:
+            child_task: Task
             if isinstance(child, _type_gen):
+                # child is a coroutine/generator
+                # i.e., async function, or function using yield (these are identical
+                # in micropython)
                 child_task = child
             else:
-                child_task = iter(child)  # type: ignore
+                # child is a layout -- type-wise, it is an Awaitable, but
+                # implementation-wise it is an Iterable and we know that its __iter__
+                # will return a Generator.
+                child_task = child.__iter__()  # type: ignore [Cannot access member "__iter__" for type "Awaitable[Unknown]";;Cannot access member "__iter__" for type "Coroutine[Unknown, Unknown, Unknown]"]
             schedule(child_task, None, None, finalizer)
             scheduled.append(child_task)
-            # TODO: document the types here
 
     def exit(self, except_for: Task | None = None) -> None:
         for task in self.scheduled:
@@ -330,12 +312,14 @@ class race(Syscall):
                 if child_task is task:
                     child = self.children[index]
                     break
+            else:
+                raise RuntimeError  # task not found in scheduled
             self.finished.append(child)
             if self.exit_others:
                 self.exit(task)
             schedule(self.callback, result)
 
-    def __iter__(self) -> Task:  # type: ignore
+    def __iter__(self) -> Task:  # type: ignore [awaitable-is-generator]
         try:
             return (yield self)
         except:  # noqa: E722
@@ -399,7 +383,7 @@ class chan:
         self.putters: list[tuple[Task | None, Any]] = []
         self.takers: list[Task] = []
 
-    def put(self, value: Any) -> Awaitable[None]:  # type: ignore
+    def put(self, value: Any) -> Awaitable[None]:  # type: ignore [awaitable-is-generator]
         put = chan.Put(self, value)
         try:
             return (yield put)
@@ -409,7 +393,7 @@ class chan:
                 self.putters.remove(entry)
             raise
 
-    def take(self) -> Awaitable[Any]:  # type: ignore
+    def take(self) -> Awaitable[Any]:  # type: ignore [awaitable-is-generator]
         take = chan.Take(self)
         try:
             return (yield take)
@@ -485,6 +469,8 @@ class spawn(Syscall):
         # schedule task immediately
         if __debug__:
             log.debug(__name__, "spawn new task: %s", task)
+
+        assert isinstance(task, _type_gen)
         schedule(task, finalizer=self._finalize)
 
     def _finalize(self, task: Task, value: Any) -> None:
@@ -507,7 +493,7 @@ class spawn(Syscall):
         if self.finalizer_callback is not None:
             self.finalizer_callback(self)
 
-    def __iter__(self) -> Task:  # type: ignore
+    def __iter__(self) -> Task:  # type: ignore [awaitable-is-generator]
         if self.finished:
             # exit immediately if we already have a return value
             if isinstance(self.return_value, BaseException):
@@ -558,3 +544,24 @@ class spawn(Syscall):
         is True, it would be calling close on self, which will result in a ValueError.
         """
         return self.task is this_task
+
+
+class Timer(Syscall):
+    def __init__(self) -> None:
+        self.task: Task | None = None
+        # Event::Attach is evaluated before task is set. Use this list to
+        # buffer timers until task is set.
+        self.before_task: list[tuple[int, Any]] = []
+
+    def handle(self, task: Task) -> None:
+        self.task = task
+        for deadline, value in self.before_task:
+            schedule(self.task, value, deadline)
+        self.before_task.clear()
+
+    def schedule(self, deadline: int, value: Any) -> None:
+        deadline = utime.ticks_add(utime.ticks_ms(), deadline)
+        if self.task is not None:
+            schedule(self.task, value, deadline)
+        else:
+            self.before_task.append((deadline, value))

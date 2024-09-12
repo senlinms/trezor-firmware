@@ -22,12 +22,11 @@
 
 #include "secbool.h"
 
-void wait_random(void);
-
 void __fatal_error(const char *expr, const char *msg, const char *file,
                    int line, const char *func);
-void error_shutdown(const char *line1, const char *line2, const char *line3,
-                    const char *line4);
+
+void show_wipe_code_screen(void);
+void show_pin_too_many_screen(void);
 
 #define ensure(expr, msg) \
   (((expr) == sectrue)    \

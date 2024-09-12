@@ -5,6 +5,10 @@ package hw.trezor.messages.management;
 option java_package = "com.satoshilabs.trezor.lib.protobuf";
 option java_outer_classname = "TrezorMessageManagement";
 
+option (include_in_bitcoin_only) = true;
+
+import "messages.proto";
+
 /**
  * Type of the mnemonic backup given/received by the device during reset/recovery.
  */
@@ -23,13 +27,25 @@ enum SafetyCheckLevel {
     PromptTemporarily = 2;  // like PromptAlways but reverts to Strict after reboot
 }
 
+
+/**
+ * Format of the homescreen image
+ */
+enum HomescreenFormat {
+    Toif = 1;   // full-color toif
+    Jpeg = 2;   // jpeg
+    ToiG = 3;   // greyscale toif
+}
+
 /**
  * Request: Reset device to default state and ask for device details
  * @start
  * @next Features
  */
 message Initialize {
-    optional bytes session_id = 1;           // assumed device session id; Trezor clears caches if it is different or empty
+    optional bytes session_id = 1;     // assumed device session id; Trezor clears caches if it is different or empty
+    optional bool _skip_passphrase = 2 [deprecated=true]; // removed as part of passphrase redesign
+    optional bool derive_cardano = 3;  // whether to derive Cardano Icarus root keys in this session
 }
 
 /**
@@ -60,7 +76,7 @@ message Features {
     optional bytes bootloader_hash = 14;        // hash of the bootloader
     optional bool imported = 15;                // was storage imported from an external source?
     optional bool unlocked = 16;                // is the device unlocked? called "pin_cached" previously
-//    optional bool passphrase_cached = 17;       // is passphrase already cached in session?  DEPRECATED
+    optional bool _passphrase_cached = 17 [deprecated=true]; // is passphrase already cached in session?
     optional bool firmware_present = 18;        // is valid firmware loaded?
     optional bool needs_backup = 19;            // does storage need backup? (equals to Storage.needs_backup)
     optional uint32 flags = 20;                 // device flags (equals to Storage.flags)
@@ -69,29 +85,31 @@ message Features {
     optional uint32 fw_minor = 23;              // reported firmware version if in bootloader mode
     optional uint32 fw_patch = 24;              // reported firmware version if in bootloader mode
     optional string fw_vendor = 25;             // reported firmware vendor if in bootloader mode
-    optional bytes fw_vendor_keys = 26;         // reported firmware vendor keys (their hash)
+    // optional bytes fw_vendor_keys = 26;      // obsoleted, use fw_vendor
     optional bool unfinished_backup = 27;       // report unfinished backup (equals to Storage.unfinished_backup)
     optional bool no_backup = 28;               // report no backup (equals to Storage.no_backup)
     optional bool recovery_mode = 29;           // is recovery mode in progress
     repeated Capability capabilities = 30;      // list of supported capabilities
     enum Capability {
-        Capability_Bitcoin = 1;
-        Capability_Bitcoin_like = 2;            // Altcoins based on the Bitcoin source code
+        option (has_bitcoin_only_values) = true;
+
+        Capability_Bitcoin = 1 [(bitcoin_only) = true];
+        Capability_Bitcoin_like = 2;                    // Altcoins based on the Bitcoin source code
         Capability_Binance = 3;
         Capability_Cardano = 4;
-        Capability_Crypto = 5;                  // generic crypto operations for GPG, SSH, etc.
+        Capability_Crypto = 5 [(bitcoin_only) = true];  // generic crypto operations for GPG, SSH, etc.
         Capability_EOS = 6;
         Capability_Ethereum = 7;
-        Capability_Lisk = 8;
+        Capability_Lisk = 8 [deprecated = true];
         Capability_Monero = 9;
         Capability_NEM = 10;
         Capability_Ripple = 11;
         Capability_Stellar = 12;
         Capability_Tezos = 13;
         Capability_U2F = 14;
-        Capability_Shamir = 15;
-        Capability_ShamirGroups = 16;
-        Capability_PassphraseEntry = 17;        // the device is capable of passphrase entry directly on the device
+        Capability_Shamir = 15 [(bitcoin_only) = true];
+        Capability_ShamirGroups = 16 [(bitcoin_only) = true];
+        Capability_PassphraseEntry = 17 [(bitcoin_only) = true];  // the device is capable of passphrase entry directly on the device
     }
     optional BackupType backup_type = 31;       // type of device backup (BIP-39 / SLIP-39 basic / SLIP-39 advanced)
     optional bool sd_card_present = 32;         // is SD card present
@@ -103,6 +121,15 @@ message Features {
     optional uint32 auto_lock_delay_ms = 38;    // number of milliseconds after which the device locks itself
     optional uint32 display_rotation = 39;      // in degrees from North
     optional bool experimental_features = 40;   // are experimental message types enabled?
+    optional bool busy = 41;                    // is the device busy, showing "Do not disconnect"?
+    optional HomescreenFormat homescreen_format = 42;   // format of the homescreen, 1 = TOIf, 2 = jpg, 3 = TOIG
+    optional bool hide_passphrase_from_host = 43;   // should we hide the passphrase when it comes from host?
+    optional string internal_model = 44;        // internal model name
+    optional uint32 unit_color = 45;          // color of the unit/device
+    optional bool unit_btconly = 46;          // unit/device is intended as bitcoin only
+    optional uint32 homescreen_width = 47;         // homescreen width in pixels
+    optional uint32 homescreen_height = 48;         // homescreen height in pixels
+    optional bool bootloader_locked = 49;       // bootloader is locked
 }
 
 /**
@@ -111,6 +138,15 @@ message Features {
  * @next Success
  */
 message LockDevice {
+}
+
+/**
+ * Request: Show a "Do not disconnect" dialog instead of the standard homescreen.
+ * @start
+ * @next Success
+ */
+message SetBusy {
+    optional uint32 expiry_ms = 1;  // The time in milliseconds after which the dialog will automatically disappear. Overrides any previously set expiry. If not set, then the dialog is hidden.
 }
 
 /**
@@ -134,12 +170,13 @@ message ApplySettings {
     optional string label = 2;
     optional bool use_passphrase = 3;
     optional bytes homescreen = 4;
-//    optional PassphraseSourceType passphrase_source = 5;  DEPRECATED
+    optional uint32 _passphrase_source = 5 [deprecated=true];   // ASK = 0; DEVICE = 1; HOST = 2;
     optional uint32 auto_lock_delay_ms = 6;
     optional uint32 display_rotation = 7;  // in degrees from North
     optional bool passphrase_always_on_device = 8;  // do not prompt for passphrase, enforce device entry
     optional SafetyCheckLevel safety_checks = 9;  // Safety check level, set to Prompt to limit path namespace enforcement
     optional bool experimental_features = 10;  // enable experimental message types
+    optional bool hide_passphrase_from_host = 11;  // do not show passphrase coming from host
 }
 
 /**
@@ -149,7 +186,7 @@ message ApplySettings {
  * @next Failure
  */
 message ApplyFlags {
-    optional uint32 flags = 1;  // bitmask, can only set bits, not unset
+    required uint32 flags = 1;  // bitmask, can only set bits, not unset
 }
 
 /**
@@ -179,7 +216,7 @@ message ChangeWipeCode {
  * @next Failure
  */
 message SdProtect {
-    optional SdProtectOperationType operation = 1;
+    required SdProtectOperationType operation = 1;
     /**
     * Structure representing SD card protection operation
     */
@@ -224,6 +261,43 @@ message GetEntropy {
  */
 message Entropy {
     required bytes entropy = 1;     // chunk of random generated bytes
+}
+
+/**
+ * Request: Get a hash of the installed firmware combined with an optional challenge.
+ * @start
+ * @next FirmwareHash
+ * @next Failure
+ */
+message GetFirmwareHash {
+    optional bytes challenge = 1;   // Blake2s key up to 32 bytes in length.
+}
+
+/**
+ * Response: Hash of the installed firmware combined with the optional challenge.
+ * @end
+ */
+message FirmwareHash {
+    required bytes hash = 1;
+}
+
+/**
+ * Request: Request a signature of the provided challenge.
+ * @start
+ * @next AuthenticityProof
+ * @next Failure
+ */
+message AuthenticateDevice {
+    required bytes challenge = 1;  // A random challenge to sign.
+}
+
+/**
+ * Response: Signature of the provided challenge along with a certificate issued by the Trezor company.
+ * @end
+ */
+message AuthenticityProof {
+    repeated bytes certificates = 1;  // A certificate chain starting with the device certificate, followed by intermediate CA certificates, the last of which is signed by Trezor company's root CA.
+    required bytes signature = 2;     // A DER-encoded signature of "\0x13AuthenticateDevice:" + length-prefixed challenge that should be verified using the device certificate.
 }
 
 /**
@@ -292,7 +366,7 @@ message EntropyRequest {
  * @next Success
  */
 message EntropyAck {
-    optional bytes entropy = 1;     // 256 bits (32 bytes) of random data
+    required bytes entropy = 1;     // 256 bits (32 bytes) of random data
 }
 
 /**
@@ -333,7 +407,7 @@ message RecoveryDevice {
  * @next WordAck
  */
 message WordRequest {
-    optional WordRequestType type = 1;
+    required WordRequestType type = 1;
     /**
     * Type of Recovery Word request
     */
@@ -360,7 +434,7 @@ message WordAck {
  * @next Success
  */
 message SetU2FCounter {
-    optional uint32 u2f_counter = 1;
+    required uint32 u2f_counter = 1;
 }
 
 /**
@@ -376,7 +450,7 @@ message GetNextU2FCounter {
  * @end
  */
 message NextU2FCounter {
-    optional uint32 u2f_counter = 1;
+    required uint32 u2f_counter = 1;
 }
 
 /**
@@ -412,4 +486,62 @@ message CancelAuthorization {
  * @next Success
  */
 message RebootToBootloader {
+}
+
+/**
+ * Request: Ask device to generate a random nonce and store it in the session's cache
+ * @start
+ * @next Nonce
+ */
+message GetNonce {
+    option (experimental_message) = true;
+}
+
+/**
+ * Response: Contains a random nonce
+ * @end
+ */
+message Nonce {
+    option (experimental_message) = true;
+
+    required bytes nonce = 1; // a 32-byte random value generated by Trezor
+}
+
+/**
+ * Request: Ask device to unlock a subtree of the keychain.
+ * @start
+ * @next UnlockedPathRequest
+ * @next Failure
+ */
+message UnlockPath {
+    repeated uint32 address_n = 1;     // prefix of the BIP-32 path leading to the account (m / purpose')
+    optional bytes mac = 2;            // the MAC returned by UnlockedPathRequest
+}
+
+/**
+ * Request: Device awaits an operation.
+ * @start
+ * @next SignTx
+ * @next GetPublicKey
+ * @next GetAddress
+ */
+message UnlockedPathRequest {
+    optional bytes mac = 1;            // authentication code for future UnlockPath calls
+}
+
+/**
+ * Request: Show tutorial screens on the device
+ * @start
+ * @next Success
+ */
+message ShowDeviceTutorial {
+}
+
+/**
+ * Request: Unlocks bootloader, !irreversible!
+ * @start
+ * @next Success
+ * @next Failure
+ */
+message UnlockBootloader {
 }

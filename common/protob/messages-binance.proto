@@ -5,6 +5,14 @@ package hw.trezor.messages.binance;
 option java_package = "com.satoshilabs.trezor.lib.protobuf";
 option java_outer_classname = "TrezorMessageBinance";
 
+/** XXX
+
+Most likely, ALL fields in this file should be `required`. We are leaving some optionals
+in place, in cases where the field value continues to the JSON as a string -- on the off
+chance that somebody is relying on the behavior.
+
+*/
+
 /**
  * Request: Ask the device for a Binance address.
  * @start
@@ -14,6 +22,7 @@ option java_outer_classname = "TrezorMessageBinance";
 message BinanceGetAddress {
     repeated uint32 address_n = 1;  // BIP-32-style path to derive the key from master node
     optional bool show_display = 2; // optionally prompt for confirmation on trezor display
+    optional bool chunkify = 3;     // display the address in chunks of 4 characters
 }
 
 /**
@@ -52,12 +61,13 @@ message BinancePublicKey {
 */
 message BinanceSignTx {
     repeated uint32 address_n = 1; // BIP-32-style path to derive the key from master node
-    optional uint32 msg_count = 2; // count of Binance<Any>Msg to be included in this tx
-    optional sint64 account_number = 3;
+    required uint32 msg_count = 2; // count of Binance<Any>Msg to be included in this tx
+    required sint64 account_number = 3;
     optional string chain_id = 4;
     optional string memo = 5;
-    optional sint64 sequence = 6;
-    optional sint64 source = 7;
+    required sint64 sequence = 6;
+    required sint64 source = 7;
+    optional bool chunkify = 8;    // display the address in chunks of 4 characters
 }
 
 /**
@@ -77,15 +87,16 @@ message BinanceTxRequest {
 message BinanceTransferMsg {
     repeated BinanceInputOutput inputs = 1;
     repeated BinanceInputOutput outputs = 2;
+    optional bool chunkify = 3;               // display the address in chunks of 4 characters
 
     message BinanceInputOutput {
-        optional string address = 1;
+        required string address = 1;
         repeated BinanceCoin coins = 2;
     }
 
     message BinanceCoin {
-        optional sint64 amount = 1;
-        optional string denom = 2;
+        required sint64 amount = 1;
+        required string denom = 2;
     }
 }
 
@@ -96,13 +107,13 @@ message BinanceTransferMsg {
  */
 message BinanceOrderMsg {
     optional string id = 1;
-    optional BinanceOrderType ordertype = 2;
-    optional sint64 price = 3;
-    optional sint64 quantity = 4;
+    required BinanceOrderType ordertype = 2;
+    required sint64 price = 3;
+    required sint64 quantity = 4;
     optional string sender = 5;
-    optional BinanceOrderSide side = 6;
+    required BinanceOrderSide side = 6;
     optional string symbol = 7;
-    optional BinanceTimeInForce timeinforce = 8;
+    required BinanceTimeInForce timeinforce = 8;
 
     enum BinanceOrderType {
         OT_UNKNOWN = 0;

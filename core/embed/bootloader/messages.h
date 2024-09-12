@@ -23,11 +23,31 @@
 #include <stdint.h>
 #include "image.h"
 #include "secbool.h"
+#include TREZOR_BOARD
 
 #define USB_TIMEOUT 500
 #define USB_PACKET_SIZE 64
 
 #define FIRMWARE_UPLOAD_CHUNK_RETRY_COUNT 2
+
+enum {
+  UPLOAD_OK = 0,
+  UPLOAD_ERR_INVALID_CHUNK_SIZE = -1,
+  UPLOAD_ERR_INVALID_VENDOR_HEADER = -2,
+  UPLOAD_ERR_INVALID_VENDOR_HEADER_SIG = -3,
+  UPLOAD_ERR_INVALID_IMAGE_HEADER = -4,
+  UPLOAD_ERR_INVALID_IMAGE_MODEL = -5,
+  UPLOAD_ERR_INVALID_IMAGE_HEADER_SIG = -6,
+  UPLOAD_ERR_USER_ABORT = -7,
+  UPLOAD_ERR_FIRMWARE_TOO_BIG = -8,
+  UPLOAD_ERR_INVALID_CHUNK_HASH = -9,
+  UPLOAD_ERR_BOOTLOADER_LOCKED = -10,
+};
+
+enum {
+  WIPE_OK = 0,
+  WIPE_ERR_CANNOT_ERASE = -1,
+};
 
 secbool msg_parse_header(const uint8_t *buf, uint16_t *msg_id,
                          uint32_t *msg_size);
@@ -47,5 +67,12 @@ int process_msg_FirmwareUpload(uint8_t iface_num, uint32_t msg_size,
                                uint8_t *buf);
 int process_msg_WipeDevice(uint8_t iface_num, uint32_t msg_size, uint8_t *buf);
 void process_msg_unknown(uint8_t iface_num, uint32_t msg_size, uint8_t *buf);
+
+#ifdef USE_OPTIGA
+void process_msg_UnlockBootloader(uint8_t iface_num, uint32_t msg_size,
+                                  uint8_t *buf);
+#endif
+
+secbool bootloader_WipeDevice(void);
 
 #endif

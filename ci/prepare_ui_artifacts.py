@@ -1,27 +1,29 @@
-import hashlib
-import json
 import shutil
+import sys
 from pathlib import Path
 
-
-def _hash_files(path):
-    files = path.iterdir()
-    hasher = hashlib.sha256()
-    for file in sorted(files):
-        hasher.update(file.read_bytes())
-
-    return hasher.digest().hex()
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+# Needed for setup purposes, filling the FILE_HASHES dict
+from tests.ui_tests.common import TestResult, _hash_files  # isort:skip
+from tests.ui_tests.common import get_current_fixtures  # isort:skip
 
 
-root = Path(__file__).parent / ".."
-screens = root / "tests/ui_tests/screens"
-fixtures = root / "tests/ui_tests/fixtures.json"
+FIXTURES = get_current_fixtures()
 
-hashes = json.loads(fixtures.read_text())
+for result in TestResult.recent_results():
+    if not result.passed or result.expected_hash != result.actual_hash:
+        print("WARNING: skipping failed test", result.test.id)
+        continue
 
-for test_case in hashes.keys():
-    recorded_dir = screens / test_case / "recorded"
-    expected_hash = hashes[test_case]
-    actual_hash = _hash_files(recorded_dir)
+    actual_hash = _hash_files(result.test.actual_dir)
+    expected_hash = (
+        FIXTURES.get(result.test.model, {})
+        .get(result.test.group, {})
+        .get(result.test.fixtures_name)
+    )
+    assert result.expected_hash == actual_hash
     assert expected_hash == actual_hash
-    shutil.make_archive(root / "ci/ui_test_records" / actual_hash, "zip", recorded_dir)
+    shutil.make_archive(
+        str(ROOT / "ci/ui_test_records" / actual_hash), "zip", result.test.actual_dir
+    )

@@ -21,12 +21,29 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "common.h"
+
 #include "py/runtime.h"
+
+#include TREZOR_BOARD
 
 #if MICROPY_PY_TREZORCRYPTO
 
+static mp_obj_t ui_wait_callback = mp_const_none;
+
+static void wrapped_ui_wait_callback(uint32_t current, uint32_t total) {
+  if (mp_obj_is_callable(ui_wait_callback)) {
+    mp_call_function_2_protected(ui_wait_callback, mp_obj_new_int(current),
+                                 mp_obj_new_int(total));
+  }
+}
+
 #include "modtrezorcrypto-aes.h"
+#include "modtrezorcrypto-bech32.h"
 #include "modtrezorcrypto-bip32.h"
+#ifdef USE_SECP256K1_ZKP
+#include "modtrezorcrypto-bip340.h"
+#endif
 #include "modtrezorcrypto-bip39.h"
 #include "modtrezorcrypto-blake256.h"
 #include "modtrezorcrypto-blake2b.h"
@@ -42,9 +59,6 @@
 #include "modtrezorcrypto-random.h"
 #include "modtrezorcrypto-ripemd160.h"
 #include "modtrezorcrypto-secp256k1.h"
-#ifdef SECP256K1_BUILD
-#include "modtrezorcrypto-secp256k1_zkp.h"
-#endif
 #include "modtrezorcrypto-sha1.h"
 #include "modtrezorcrypto-sha256.h"
 #include "modtrezorcrypto-sha3-256.h"
@@ -52,7 +66,11 @@
 #include "modtrezorcrypto-sha512.h"
 #include "modtrezorcrypto-shamir.h"
 #include "modtrezorcrypto-slip39.h"
+#ifdef USE_OPTIGA
+#include "modtrezorcrypto-optiga.h"
+#endif
 #if !BITCOIN_ONLY
+#include "modtrezorcrypto-cardano.h"
 #include "modtrezorcrypto-monero.h"
 #include "modtrezorcrypto-nem.h"
 #endif
@@ -60,12 +78,17 @@
 STATIC const mp_rom_map_elem_t mp_module_trezorcrypto_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_trezorcrypto)},
     {MP_ROM_QSTR(MP_QSTR_aes), MP_ROM_PTR(&mod_trezorcrypto_AES_type)},
+    {MP_ROM_QSTR(MP_QSTR_bech32), MP_ROM_PTR(&mod_trezorcrypto_bech32_module)},
     {MP_ROM_QSTR(MP_QSTR_bip32), MP_ROM_PTR(&mod_trezorcrypto_bip32_module)},
     {MP_ROM_QSTR(MP_QSTR_bip39), MP_ROM_PTR(&mod_trezorcrypto_bip39_module)},
     {MP_ROM_QSTR(MP_QSTR_blake256),
      MP_ROM_PTR(&mod_trezorcrypto_Blake256_type)},
     {MP_ROM_QSTR(MP_QSTR_blake2b), MP_ROM_PTR(&mod_trezorcrypto_Blake2b_type)},
     {MP_ROM_QSTR(MP_QSTR_blake2s), MP_ROM_PTR(&mod_trezorcrypto_Blake2s_type)},
+#if !BITCOIN_ONLY
+    {MP_ROM_QSTR(MP_QSTR_cardano),
+     MP_ROM_PTR(&mod_trezorcrypto_cardano_module)},
+#endif
     {MP_ROM_QSTR(MP_QSTR_chacha20poly1305),
      MP_ROM_PTR(&mod_trezorcrypto_ChaCha20Poly1305_type)},
     {MP_ROM_QSTR(MP_QSTR_crc), MP_ROM_PTR(&mod_trezorcrypto_crc_module)},
@@ -90,9 +113,8 @@ STATIC const mp_rom_map_elem_t mp_module_trezorcrypto_globals_table[] = {
      MP_ROM_PTR(&mod_trezorcrypto_Ripemd160_type)},
     {MP_ROM_QSTR(MP_QSTR_secp256k1),
      MP_ROM_PTR(&mod_trezorcrypto_secp256k1_module)},
-#ifdef SECP256K1_BUILD
-    {MP_ROM_QSTR(MP_QSTR_secp256k1_zkp),
-     MP_ROM_PTR(&mod_trezorcrypto_secp256k1_zkp_module)},
+#if USE_SECP256K1_ZKP
+    {MP_ROM_QSTR(MP_QSTR_bip340), MP_ROM_PTR(&mod_trezorcrypto_bip340_module)},
 #endif
     {MP_ROM_QSTR(MP_QSTR_sha1), MP_ROM_PTR(&mod_trezorcrypto_Sha1_type)},
     {MP_ROM_QSTR(MP_QSTR_sha256), MP_ROM_PTR(&mod_trezorcrypto_Sha256_type)},
@@ -103,16 +125,32 @@ STATIC const mp_rom_map_elem_t mp_module_trezorcrypto_globals_table[] = {
      MP_ROM_PTR(&mod_trezorcrypto_Sha3_512_type)},
     {MP_ROM_QSTR(MP_QSTR_shamir), MP_ROM_PTR(&mod_trezorcrypto_shamir_module)},
     {MP_ROM_QSTR(MP_QSTR_slip39), MP_ROM_PTR(&mod_trezorcrypto_slip39_module)},
+#if USE_OPTIGA
+    {MP_ROM_QSTR(MP_QSTR_optiga), MP_ROM_PTR(&mod_trezorcrypto_optiga_module)},
+#endif
 };
 STATIC MP_DEFINE_CONST_DICT(mp_module_trezorcrypto_globals,
                             mp_module_trezorcrypto_globals_table);
 
 const mp_obj_module_t mp_module_trezorcrypto = {
     .base = {&mp_type_module},
-    .globals = (mp_obj_dict_t*)&mp_module_trezorcrypto_globals,
+    .globals = (mp_obj_dict_t *)&mp_module_trezorcrypto_globals,
 };
 
-MP_REGISTER_MODULE(MP_QSTR_trezorcrypto, mp_module_trezorcrypto,
-                   MICROPY_PY_TREZORCRYPTO);
+MP_REGISTER_MODULE(MP_QSTR_trezorcrypto, mp_module_trezorcrypto);
+
+#ifdef USE_SECP256K1_ZKP
+void secp256k1_default_illegal_callback_fn(const char *str, void *data) {
+  (void)data;
+  mp_raise_ValueError(str);
+  return;
+}
+
+void secp256k1_default_error_callback_fn(const char *str, void *data) {
+  (void)data;
+  __fatal_error(NULL, str, __FILE__, __LINE__, __func__);
+  return;
+}
+#endif
 
 #endif  // MICROPY_PY_TREZORCRYPTO

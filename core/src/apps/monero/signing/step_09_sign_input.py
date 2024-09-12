@@ -1,5 +1,5 @@
 """
-Generates a MLSAG signature for one input.
+Generates a clsag signature for one input.
 
 Mask Balancing.
 Sum of input masks has to be equal to the sum of output masks.
@@ -11,24 +11,20 @@ on output masks as pseudo outputs have to remain same.
 """
 
 import gc
+from typing import TYPE_CHECKING
 
-from trezor import utils
-
-from apps.monero.layout import confirms
-from apps.monero.xmr import crypto
-
-from .state import State
-
-if False:
-    from trezor.messages.MoneroTransactionSourceEntry import (
+if TYPE_CHECKING:
+    from trezor.messages import (
+        MoneroTransactionSignInputAck,
         MoneroTransactionSourceEntry,
     )
-    from trezor.messages.MoneroTransactionSignInputAck import (
-        MoneroTransactionSignInputAck,
-    )
+
+    from apps.monero.layout import MoneroTransactionProgress
+
+    from .state import State
 
 
-async def sign_input(
+def sign_input(
     state: State,
     src_entr: MoneroTransactionSourceEntry,
     vini_bin: bytes,
@@ -38,6 +34,7 @@ async def sign_input(
     pseudo_out_alpha_enc: bytes,
     spend_enc: bytes,
     orig_idx: int,
+    progress: MoneroTransactionProgress,
 ) -> MoneroTransactionSignInputAck:
     """
     :param state: transaction state
@@ -52,25 +49,28 @@ async def sign_input(
     :param orig_idx: original index of the src_entr before sorting (HMAC check)
     :return: Generated signature MGs[i]
     """
-    await confirms.transaction_step(
-        state, state.STEP_SIGN, state.current_input_index + 1
-    )
+    from trezor import utils
+
+    from apps.monero.xmr import crypto, crypto_helpers
+
+    ensure = utils.ensure  # local_cache_attribute
+    mem_trace = state.mem_trace  # local_cache_attribute
+    input_count = state.input_count  # local_cache_attribute
+    outputs = src_entr.outputs  # local_cache_attribute
+
+    progress.step(state, state.STEP_SIGN, state.current_input_index + 1)
 
     state.current_input_index += 1
     if state.last_step not in (state.STEP_ALL_OUT, state.STEP_SIGN):
         raise ValueError("Invalid state transition")
-    if state.current_input_index >= state.input_count:
+    if state.current_input_index >= input_count:
         raise ValueError("Invalid inputs count")
     if pseudo_out is None:
         raise ValueError("SimpleRCT requires pseudo_out but none provided")
     if pseudo_out_alpha_enc is None:
         raise ValueError("SimpleRCT requires pseudo_out's mask but none provided")
 
-    input_position = (
-        state.source_permutation[state.current_input_index]
-        if state.client_version <= 1
-        else orig_idx
-    )
+    input_position = orig_idx
     mods = utils.unimport_begin()
 
     # Check input's HMAC
@@ -87,15 +87,15 @@ async def sign_input(
     if state.current_input_index > 0 and state.last_ki <= cur_ki:
         raise ValueError("Key image order invalid")
 
-    state.last_ki = cur_ki if state.current_input_index < state.input_count else None
+    state.last_ki = cur_ki if state.current_input_index < input_count else None
     del (cur_ki, vini_bin, vini_hmac, vini_hmac_comp)
 
     gc.collect()
-    state.mem_trace(1, True)
+    mem_trace(1, True)
 
-    from apps.monero.xmr.crypto import chacha_poly
+    from apps.monero.xmr import chacha_poly
 
-    pseudo_out_alpha = crypto.decodeint(
+    pseudo_out_alpha = crypto_helpers.decodeint(
         chacha_poly.decrypt_pack(
             offloading_keys.enc_key_txin_alpha(state.key_enc, input_position),
             bytes(pseudo_out_alpha_enc),
@@ -103,34 +103,36 @@ async def sign_input(
     )
 
     # Last pseudo_out is recomputed so mask sums hold
-    if input_position + 1 == state.input_count:
+    if input_position + 1 == input_count:
         # Recompute the lash alpha so the sum holds
-        state.mem_trace("Correcting alpha")
-        alpha_diff = crypto.sc_sub(state.sumout, state.sumpouts_alphas)
+        mem_trace("Correcting alpha")
+        alpha_diff = crypto.sc_sub_into(None, state.sumout, state.sumpouts_alphas)
         crypto.sc_add_into(pseudo_out_alpha, pseudo_out_alpha, alpha_diff)
-        pseudo_out_c = crypto.gen_commitment(pseudo_out_alpha, state.input_last_amount)
+        pseudo_out_c = crypto.gen_commitment_into(
+            None, pseudo_out_alpha, state.input_last_amount
+        )
 
     else:
-        if input_position + 1 == state.input_count:
-            utils.ensure(
-                crypto.sc_eq(state.sumpouts_alphas, state.sumout), "Sum eq error"
+        if input_position + 1 == input_count:
+            ensure(
+                crypto.sc_eq(state.sumpouts_alphas, state.sumout) != 0, "Sum eq error"
             )
 
         # both pseudo_out and its mask were offloaded so we need to
         # validate pseudo_out's HMAC and decrypt the alpha
-        pseudo_out_hmac_comp = crypto.compute_hmac(
+        pseudo_out_hmac_comp = crypto_helpers.compute_hmac(
             offloading_keys.hmac_key_txin_comm(state.key_hmac, input_position),
             pseudo_out,
         )
         if not crypto.ct_equals(pseudo_out_hmac_comp, pseudo_out_hmac):
             raise ValueError("HMAC is not correct")
 
-        pseudo_out_c = crypto.decodepoint(pseudo_out)
+        pseudo_out_c = crypto_helpers.decodepoint(pseudo_out)
 
-    state.mem_trace(2, True)
+    mem_trace(2, True)
 
     # Spending secret
-    spend_key = crypto.decodeint(
+    spend_key = crypto_helpers.decodeint(
         chacha_poly.decrypt_pack(
             offloading_keys.enc_key_spend(state.key_enc, input_position),
             bytes(spend_enc),
@@ -146,81 +148,69 @@ async def sign_input(
         spend_enc,
     )
     utils.unimport_end(mods)
-    state.mem_trace(3, True)
+    mem_trace(3, True)
 
     # Basic setup, sanity check
     from apps.monero.xmr.serialize_messages.tx_ct_key import CtKey
 
     index = src_entr.real_output
-    input_secret_key = CtKey(spend_key, crypto.decodeint(src_entr.mask))
+    input_secret_key = CtKey(spend_key, crypto_helpers.decodeint(src_entr.mask))
 
     # Private key correctness test
-    utils.ensure(
+    ensure(
         crypto.point_eq(
-            crypto.decodepoint(src_entr.outputs[src_entr.real_output].key.dest),
-            crypto.scalarmult_base(input_secret_key.dest),
+            crypto_helpers.decodepoint(src_entr.outputs[src_entr.real_output].key.dest),
+            crypto.scalarmult_base_into(None, input_secret_key.dest),
         ),
         "Real source entry's destination does not equal spend key's",
     )
-    utils.ensure(
+    ensure(
         crypto.point_eq(
-            crypto.decodepoint(src_entr.outputs[src_entr.real_output].key.commitment),
-            crypto.gen_commitment(input_secret_key.mask, src_entr.amount),
+            crypto_helpers.decodepoint(
+                src_entr.outputs[src_entr.real_output].key.commitment
+            ),
+            crypto.gen_commitment_into(None, input_secret_key.mask, src_entr.amount),
         ),
         "Real source entry's mask does not equal spend key's",
     )
 
-    state.mem_trace(4, True)
+    mem_trace(4, True)
 
-    from apps.monero.xmr import mlsag
-    from apps.monero import signing
+    from apps.monero.xmr import clsag
 
     mg_buffer = []
-    ring_pubkeys = [x.key for x in src_entr.outputs if x]
-    utils.ensure(len(ring_pubkeys) == len(src_entr.outputs), "Invalid ring")
+    ring_pubkeys = [x.key for x in outputs if x]
+    ensure(len(ring_pubkeys) == len(outputs), "Invalid ring")
     del src_entr
 
-    state.mem_trace(5, True)
+    mem_trace(5, True)
 
-    if state.tx_type == signing.RctType.CLSAG:
-        state.mem_trace("CLSAG")
-        mlsag.generate_clsag_simple(
-            state.full_message,
-            ring_pubkeys,
-            input_secret_key,
-            pseudo_out_alpha,
-            pseudo_out_c,
-            index,
-            mg_buffer,
-        )
-    else:
-        mlsag.generate_mlsag_simple(
-            state.full_message,
-            ring_pubkeys,
-            input_secret_key,
-            pseudo_out_alpha,
-            pseudo_out_c,
-            index,
-            mg_buffer,
-        )
-
-    del (CtKey, input_secret_key, pseudo_out_alpha, mlsag, ring_pubkeys)
-    state.mem_trace(6, True)
-
-    from trezor.messages.MoneroTransactionSignInputAck import (
-        MoneroTransactionSignInputAck,
+    assert state.full_message is not None
+    mem_trace("CLSAG")
+    clsag.generate_clsag_simple(
+        state.full_message,
+        ring_pubkeys,
+        input_secret_key,
+        pseudo_out_alpha,
+        pseudo_out_c,
+        index,
+        mg_buffer,
     )
 
-    # Encrypt signature, reveal once protocol finishes OK
-    if state.client_version >= 3:
-        utils.unimport_end(mods)
-        state.mem_trace(7, True)
-        mg_buffer = _protect_signature(state, mg_buffer)
+    del (CtKey, input_secret_key, pseudo_out_alpha, clsag, ring_pubkeys)
+    mem_trace(6, True)
 
-    state.mem_trace(8, True)
+    from trezor.messages import MoneroTransactionSignInputAck
+
+    # Encrypt signature, reveal once protocol finishes OK
+    utils.unimport_end(mods)
+    mem_trace(7, True)
+    mg_buffer = _protect_signature(state, mg_buffer)
+
+    mem_trace(8, True)
     state.last_step = state.STEP_SIGN
     return MoneroTransactionSignInputAck(
-        signature=mg_buffer, pseudo_out=crypto.encodepoint(pseudo_out_c)
+        signature=mg_buffer, pseudo_out=crypto_helpers.encodepoint(pseudo_out_c)
     )
 
 
@@ -230,8 +220,8 @@ def _protect_signature(state: State, mg_buffer: list[bytes]) -> list[bytes]:
     After protocol finishes without error, opening_key is sent to the
     host.
     """
-    from trezor.crypto import random
-    from trezor.crypto import chacha20poly1305
+    from trezor.crypto import chacha20poly1305, random
+
     from apps.monero.signing import offloading_keys
 
     if state.last_step != state.STEP_SIGN:
@@ -247,11 +237,9 @@ def _protect_signature(state: State, mg_buffer: list[bytes]) -> list[bytes]:
 
     cipher = chacha20poly1305(key, nonce)
 
-    """
-    cipher.update() input has to be 512 bit long (besides the last block).
-    Thus we go over mg_buffer and buffer 512 bit input blocks before
-    calling cipher.update().
-    """
+    # cipher.update() input has to be 512 bit long (besides the last block).
+    # Thus we go over mg_buffer and buffer 512 bit input blocks before
+    # calling cipher.update().
     CHACHA_BLOCK = 64  # 512 bit chacha key-stream block size
     buff = bytearray(CHACHA_BLOCK)
     buff_len = 0  # valid bytes in the block buffer

@@ -67,15 +67,20 @@ STATIC mp_obj_t mod_trezorcrypto_secp256k1_publickey(size_t n_args,
     mp_raise_ValueError("Invalid length of secret key");
   }
   vstr_t pk = {0};
+  int ret = 0;
   bool compressed = n_args < 2 || args[1] == mp_const_true;
   if (compressed) {
     vstr_init_len(&pk, 33);
-    ecdsa_get_public_key33(&secp256k1, (const uint8_t *)sk.buf,
-                           (uint8_t *)pk.buf);
+    ret = ecdsa_get_public_key33(&secp256k1, (const uint8_t *)sk.buf,
+                                 (uint8_t *)pk.buf);
   } else {
     vstr_init_len(&pk, 65);
-    ecdsa_get_public_key65(&secp256k1, (const uint8_t *)sk.buf,
-                           (uint8_t *)pk.buf);
+    ret = ecdsa_get_public_key65(&secp256k1, (const uint8_t *)sk.buf,
+                                 (uint8_t *)pk.buf);
+  }
+  if (0 != ret) {
+    vstr_clear(&pk);
+    mp_raise_ValueError("Invalid secret key");
   }
   return mp_obj_new_str_from_vstr(&mp_type_bytes, &pk);
 }
@@ -181,10 +186,10 @@ STATIC mp_obj_t mod_trezorcrypto_secp256k1_verify(mp_obj_t public_key,
   if (dig.len != 32) {
     return mp_const_false;
   }
-  return mp_obj_new_bool(
-      0 == ecdsa_verify_digest(&secp256k1, (const uint8_t *)pk.buf,
-                               (const uint8_t *)sig.buf + offset,
-                               (const uint8_t *)dig.buf));
+  int ret = ecdsa_verify_digest(&secp256k1, (const uint8_t *)pk.buf,
+                                (const uint8_t *)sig.buf + offset,
+                                (const uint8_t *)dig.buf);
+  return mp_obj_new_bool(ret == 0);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_3(mod_trezorcrypto_secp256k1_verify_obj,
                                  mod_trezorcrypto_secp256k1_verify);
@@ -213,9 +218,9 @@ STATIC mp_obj_t mod_trezorcrypto_secp256k1_verify_recover(mp_obj_t signature,
   recid &= 3;
   vstr_t pk = {0};
   vstr_init_len(&pk, 65);
-  if (0 == ecdsa_recover_pub_from_sig(&secp256k1, (uint8_t *)pk.buf,
-                                      (const uint8_t *)sig.buf + 1,
-                                      (const uint8_t *)dig.buf, recid)) {
+  if (ecdsa_recover_pub_from_sig(&secp256k1, (uint8_t *)pk.buf,
+                                 (const uint8_t *)sig.buf + 1,
+                                 (const uint8_t *)dig.buf, recid) == 0) {
     if (compressed) {
       pk.buf[0] = 0x02 | (pk.buf[64] & 1);
       pk.len = 33;

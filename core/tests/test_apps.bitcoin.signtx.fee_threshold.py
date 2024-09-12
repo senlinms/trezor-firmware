@@ -2,27 +2,27 @@ from common import *
 
 from trezor.utils import chunks
 from trezor.crypto import bip32, bip39
-from trezor.messages.SignTx import SignTx
-from trezor.messages.TxAckInput import TxAckInput
-from trezor.messages.TxAckInputWrapper import TxAckInputWrapper
-from trezor.messages.TxInput import TxInput
-from trezor.messages.TxAckOutput import TxAckOutput
-from trezor.messages.TxAckOutputWrapper import TxAckOutputWrapper
-from trezor.messages.TxOutput import TxOutput
-from trezor.messages.TxAckPrevMeta import TxAckPrevMeta
-from trezor.messages.PrevTx import PrevTx
-from trezor.messages.TxAckPrevInput import TxAckPrevInput
-from trezor.messages.TxAckPrevInputWrapper import TxAckPrevInputWrapper
-from trezor.messages.PrevInput import PrevInput
-from trezor.messages.TxAckPrevOutput import TxAckPrevOutput
-from trezor.messages.TxAckPrevOutputWrapper import TxAckPrevOutputWrapper
-from trezor.messages.PrevOutput import PrevOutput
-from trezor.messages.TxRequest import TxRequest
-from trezor.messages.RequestType import TXINPUT, TXOUTPUT, TXMETA
-from trezor.messages.TxRequestDetailsType import TxRequestDetailsType
-from trezor.messages.TxRequestSerializedType import TxRequestSerializedType
-from trezor.messages import AmountUnit
-from trezor.messages import OutputScriptType
+from trezor.messages import SignTx
+from trezor.messages import TxAckInput
+from trezor.messages import TxAckInputWrapper
+from trezor.messages import TxInput
+from trezor.messages import TxAckOutput
+from trezor.messages import TxAckOutputWrapper
+from trezor.messages import TxOutput
+from trezor.messages import TxAckPrevMeta
+from trezor.messages import PrevTx
+from trezor.messages import TxAckPrevInput
+from trezor.messages import TxAckPrevInputWrapper
+from trezor.messages import PrevInput
+from trezor.messages import TxAckPrevOutput
+from trezor.messages import TxAckPrevOutputWrapper
+from trezor.messages import PrevOutput
+from trezor.messages import TxRequest
+from trezor.enums.RequestType import TXINPUT, TXOUTPUT, TXMETA
+from trezor.messages import TxRequestDetailsType
+from trezor.messages import TxRequestSerializedType
+from trezor.enums import AmountUnit
+from trezor.enums import OutputScriptType
 
 from apps.common import coins
 from apps.common.keychain import Keychain
@@ -85,7 +85,7 @@ class TestSignTxFeeThreshold(unittest.TestCase):
             TxAckPrevOutput(tx=TxAckPrevOutputWrapper(output=pout1)),
             TxRequest(request_type=TXOUTPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=None),
             TxAckOutput(tx=TxAckOutputWrapper(output=out1)),
-            helpers.UiConfirmOutput(out1, coin_bitcoin, AmountUnit.BITCOIN),
+            helpers.UiConfirmOutput(out1, coin_bitcoin, AmountUnit.BITCOIN, 0, False),
             True,
             helpers.UiConfirmFeeOverThreshold(100000, coin_bitcoin),
             True,
@@ -134,6 +134,9 @@ class TestSignTxFeeThreshold(unittest.TestCase):
                             address_n=[])
         tx = SignTx(coin_name=None, version=1, lock_time=0, inputs_count=1, outputs_count=1)
 
+        # precomputed tx weight is 768
+        fee_rate = 90000 / (768 / 4)
+
         messages = [
             None,
 
@@ -143,9 +146,11 @@ class TestSignTxFeeThreshold(unittest.TestCase):
             True,
             TxRequest(request_type=TXOUTPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=EMPTY_SERIALIZED),
             TxAckOutput(tx=TxAckOutputWrapper(output=out1)),
-            helpers.UiConfirmOutput(out1, coin_bitcoin, AmountUnit.BITCOIN),
+            helpers.UiConfirmOutput(out1, coin_bitcoin, AmountUnit.BITCOIN, 0, False),
             True,
-            helpers.UiConfirmTotal(300000 + 90000, 90000, coin_bitcoin, AmountUnit.BITCOIN),
+            helpers.UiConfirmMultipleAccounts(),
+            True,
+            helpers.UiConfirmTotal(300000 + 90000, 90000, fee_rate, coin_bitcoin, AmountUnit.BITCOIN, None),
             True,
             TxRequest(request_type=TXINPUT, details=TxRequestDetailsType(request_index=0, tx_hash=None), serialized=EMPTY_SERIALIZED),
             TxAckInput(tx=TxAckInputWrapper(input=inp1)),

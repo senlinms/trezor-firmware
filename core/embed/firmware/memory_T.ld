@@ -9,7 +9,8 @@ MEMORY {
   SRAM   (wal) : ORIGIN = 0x20000000, LENGTH = 192K
 }
 
-main_stack_base = ORIGIN(SRAM) + LENGTH(SRAM); /* 8-byte aligned full descending stack */
+main_stack_base = ORIGIN(SRAM) + SIZEOF(.stack); /* 8-byte aligned full descending stack */
+_sstack = ORIGIN(SRAM);
 _estack = main_stack_base;
 
 /* used by the startup code to populate variables used by the C code */
@@ -20,6 +21,9 @@ data_size = SIZEOF(.data);
 /* used by the startup code to wipe memory */
 ccmram_start = ORIGIN(CCMRAM);
 ccmram_end = ORIGIN(CCMRAM) + LENGTH(CCMRAM);
+
+/* IMAGE_HEADER_SIZE is 0x400, this is for interaction-less firmware update start */
+firmware_header_start = ccmram_end - 0x400;
 
 /* used by the startup code to wipe memory */
 sram_start = ORIGIN(SRAM);
@@ -44,6 +48,14 @@ SECTIONS {
 
   .flash2 : ALIGN(512) {
     build/firmware/frozen_mpy.o(.rodata*);
+    build/firmware/vendor/secp256k1-zkp/src/secp256k1.o(.rodata*);
+    build/firmware/vendor/secp256k1-zkp/src/precomputed_ecmult.o(.rodata*);
+    build/firmware/vendor/secp256k1-zkp/src/precomputed_ecmult_gen.o(.rodata*);
+    build/firmware/vendor/trezor-crypto/aes/aestab.o(.rodata*);
+    . = ALIGN(4);
+    */libtrezor_lib.a:(.text*);
+    . = ALIGN(4);
+    */libtrezor_lib.a:(.rodata*);
     . = ALIGN(512);
   } >FLASH2 AT>FLASH2
 
@@ -54,9 +66,14 @@ SECTIONS {
     . = ALIGN(4);
     *(.rodata*);
     . = ALIGN(4);
+    KEEP(*(.bootloader));
     *(.bootloader*);
     . = ALIGN(512);
   } >FLASH AT>FLASH
+
+  .stack : ALIGN(8) {
+    . = 16K; /* Exactly 16K allocated for stack. Overflow causes MemManage fault (when using MPU). */
+  } >SRAM
 
   .data : ALIGN(4) {
     *(.data*);
@@ -70,10 +87,11 @@ SECTIONS {
 
   .heap : ALIGN(4) {
     . = 37K; /* this acts as a build time assertion that at least this much memory is available for heap use */
-    . = ABSOLUTE(sram_end - 16K); /* this explicitly sets the end of the heap effectively giving the stack at most 16K */
+    . = ABSOLUTE(sram_end); /* this explicitly sets the end of the heap */
   } >SRAM
 
-  .stack : ALIGN(8) {
-    . = 4K; /* this acts as a build time assertion that at least this much memory is available for stack use */
-  } >SRAM
+  .data_ccm : ALIGN(4) {
+    *(.no_dma_buffers*);
+    . = ALIGN(4);
+  } >CCMRAM
 }

@@ -41,12 +41,6 @@ If you wish to check that all test cases in `fixtures.json` were used set the `-
 pytest tests/device_tests --ui=test --ui-check-missing
 ```
 
-You can also skip tests marked as `skip_ui`.
-
-```sh
-pytest tests/device_tests --ui=test -m "not skip_ui"
-```
-
 # Updating Fixtures ("Recording")
 
 Short version:
@@ -79,10 +73,15 @@ pytest tests/device_tests --ui=record --ui-check-missing
 ### Tests
 
 Each `--ui=test` creates a clear report which tests passed and which failed.
-The index file is stored in `tests/ui_tests/reporting/reports/test/index.html`, but for an ease of use
-you will find a link at the end of the pytest summary.
+The index file is stored in `tests/ui_tests/reports/test/index.html`.
+The script `tests/show_results.py` starts a local HTTP server that serves this page --
+this is necessary for access to browser local storage, which enables a simple reviewer
+UI.
 
-On CI this report is published as an artifact. You can see the latest master report [here](https://gitlab.com/satoshilabs/trezor/trezor-firmware/-/jobs/artifacts/master/file/test_ui_report/index.html?job=core%20device%20ui%20test).
+On CI this report is published as an artifact. You can see the latest master report [here](https://gitlab.com/satoshilabs/trezor/trezor-firmware/-/jobs/artifacts/master/file/test_ui_report/index.html?job=core%20device%20test). The reviewer features work directly here.
+
+If needed, you can use `python3 -m tests.ui_tests` to regenerate the report from local
+recorded screens.
 
 ### Master diff
 
@@ -91,5 +90,5 @@ creates a report where you find which tests were altered, added, or removed rela
 master. This useful for Pull Requests.
 
 This report is available as an artifact on CI as well. You can find it by
-visiting the "core unix ui changes" job in your pipeline - browse the
+visiting the "unix ui changes" job in your pipeline - browse the
 artifacts and open `master_diff/index.html`.

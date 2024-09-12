@@ -1,117 +1,134 @@
-from trezor import ui
-from trezor.messages import ButtonRequestType
-from trezor.strings import format_amount
-from trezor.ui.components.tt.scroll import Paginated
-from trezor.ui.components.tt.text import Text
-from trezor.utils import chunks
+from trezor.enums import ButtonRequestType
+from trezor.ui.layouts import confirm_address, confirm_metadata, confirm_properties
 
-from apps.common.confirm import require_confirm, require_hold_to_confirm
-
-from .helpers import TEZOS_AMOUNT_DECIMALS
+BR_SIGN_TX = ButtonRequestType.SignTx  # global_import_cache
 
 
-async def require_confirm_tx(ctx, to, value):
-    text = Text("Confirm sending", ui.ICON_SEND, ui.GREEN)
-    text.bold(format_tezos_amount(value))
-    text.normal("to")
-    text.mono(*split_address(to))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_tx(to: str, value: int, chunkify: bool = False) -> None:
+    from trezor.ui.layouts import confirm_output
+
+    await confirm_output(
+        to,
+        format_tezos_amount(value),
+        br_code=BR_SIGN_TX,
+        chunkify=chunkify,
+    )
 
 
-async def require_confirm_fee(ctx, value, fee):
-    text = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN)
-    text.normal("Amount:")
-    text.bold(format_tezos_amount(value))
-    text.normal("Fee:")
-    text.bold(format_tezos_amount(fee))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_fee(value: int, fee: int) -> None:
+    from trezor.ui.layouts import confirm_total
+
+    await confirm_total(
+        format_tezos_amount(value),
+        format_tezos_amount(fee),
+        total_label="Amount:",
+    )
 
 
-async def require_confirm_origination(ctx, address):
-    text = Text("Confirm origination", ui.ICON_SEND, ui.ORANGE)
-    text.normal("Address:")
-    text.mono(*split_address(address))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_origination(address: str) -> None:
+    await confirm_address(
+        "Confirm origination",
+        address,
+        "Address:",
+        "confirm_origination",
+        BR_SIGN_TX,
+    )
 
 
-async def require_confirm_origination_fee(ctx, balance, fee):
-    text = Text("Confirm origination", ui.ICON_SEND, ui.ORANGE)
-    text.normal("Balance:")
-    text.bold(format_tezos_amount(balance))
-    text.normal("Fee:")
-    text.bold(format_tezos_amount(fee))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_origination_fee(balance: int, fee: int) -> None:
+    await confirm_properties(
+        "confirm_origination_final",
+        "Confirm origination",
+        (
+            ("Balance:", format_tezos_amount(balance)),
+            ("Fee:", format_tezos_amount(fee)),
+        ),
+        hold=True,
+    )
 
 
-async def require_confirm_delegation_baker(ctx, baker):
-    text = Text("Confirm delegation", ui.ICON_SEND, ui.BLUE)
-    text.normal("Baker address:")
-    text.mono(*split_address(baker))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_delegation_baker(baker: str) -> None:
+    await confirm_address(
+        "Confirm delegation",
+        baker,
+        "Baker address:",
+        "confirm_delegation",
+        BR_SIGN_TX,
+    )
 
 
-async def require_confirm_set_delegate(ctx, fee):
-    text = Text("Confirm delegation", ui.ICON_SEND, ui.BLUE)
-    text.normal("Fee:")
-    text.bold(format_tezos_amount(fee))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_set_delegate(fee: int) -> None:
+    await confirm_metadata(
+        "confirm_delegation_final",
+        "Confirm delegation",
+        "Fee:\n{}",
+        format_tezos_amount(fee),
+        BR_SIGN_TX,
+        hold=True,
+    )
 
 
-async def require_confirm_register_delegate(ctx, address, fee):
-    text = Text("Register delegate", ui.ICON_SEND, ui.BLUE)
-    text.bold("Fee: " + format_tezos_amount(fee))
-    text.normal("Address:")
-    text.mono(*split_address(address))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_register_delegate(address: str, fee: int) -> None:
+    await confirm_properties(
+        "confirm_register_delegate",
+        "Register delegate",
+        (
+            ("Fee:", format_tezos_amount(fee)),
+            ("Address:", address),
+        ),
+        hold=True,
+        br_code=BR_SIGN_TX,
+    )
 
 
-def split_address(address):
-    return chunks(address, 18)
+def format_tezos_amount(value: int) -> str:
+    from trezor.strings import format_amount
 
+    from .helpers import TEZOS_AMOUNT_DECIMALS
 
-def split_proposal(proposal):
-    return chunks(proposal, 17)
-
-
-def format_tezos_amount(value):
     formatted_value = format_amount(value, TEZOS_AMOUNT_DECIMALS)
     return formatted_value + " XTZ"
 
 
-async def require_confirm_ballot(ctx, proposal, ballot):
-    text = Text("Submit ballot", ui.ICON_SEND, icon_color=ui.PURPLE)
-    text.bold("Ballot: {}".format(ballot))
-    text.bold("Proposal:")
-    text.mono(*split_proposal(proposal))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_ballot(proposal: str, ballot: str) -> None:
+    await confirm_properties(
+        "confirm_ballot",
+        "Submit ballot",
+        (
+            ("Ballot:", ballot),
+            ("Proposal:", proposal),
+        ),
+        hold=True,
+        br_code=BR_SIGN_TX,
+    )
 
 
-async def require_confirm_proposals(ctx, proposals):
-    if len(proposals) > 1:
-        title = "Submit proposals"
-    else:
-        title = "Submit proposal"
-
-    pages = []
-    for page, proposal in enumerate(proposals):
-        text = Text(title, ui.ICON_SEND, icon_color=ui.PURPLE)
-        text.bold("Proposal {}: ".format(page + 1))
-        text.mono(*split_proposal(proposal))
-        pages.append(text)
-    paginated = Paginated(pages)
-
-    await require_confirm(ctx, paginated, ButtonRequestType.SignTx)
+async def require_confirm_proposals(proposals: list[str]) -> None:
+    await confirm_properties(
+        "confirm_proposals",
+        "Submit proposals" if len(proposals) > 1 else "Submit proposal",
+        [("Proposal " + str(i), proposal) for i, proposal in enumerate(proposals, 1)],
+        hold=True,
+        br_code=BR_SIGN_TX,
+    )
 
 
-async def require_confirm_delegation_manager_withdraw(ctx, address):
-    text = Text("Remove delegation", ui.ICON_RECEIVE, icon_color=ui.RED)
-    text.bold("Delegator:")
-    text.mono(*split_address(address))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_delegation_manager_withdraw(address: str) -> None:
+    await confirm_address(
+        "Remove delegation",
+        address,
+        "Delegator:",
+        "confirm_undelegation",
+        BR_SIGN_TX,
+    )
 
 
-async def require_confirm_manager_remove_delegate(ctx, fee):
-    text = Text("Remove delegation", ui.ICON_RECEIVE, ui.RED)
-    text.normal("Fee:")
-    text.bold(format_tezos_amount(fee))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_manager_remove_delegate(fee: int) -> None:
+    await confirm_metadata(
+        "confirm_undelegation_final",
+        "Remove delegation",
+        "Fee:\n{}",
+        format_tezos_amount(fee),
+        BR_SIGN_TX,
+        hold=True,
+    )

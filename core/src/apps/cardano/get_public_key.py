@@ -1,47 +1,54 @@
+from typing import TYPE_CHECKING
 from ubinascii import hexlify
 
-from trezor import log, wire
-from trezor.messages.CardanoPublicKey import CardanoPublicKey
-from trezor.messages.HDNodeType import HDNodeType
-from trezor.ui.layouts import show_pubkey
-
-from apps.common import paths
-
 from . import seed
-from .helpers.paths import SCHEMA_PUBKEY
-from .helpers.utils import derive_public_key
 
-if False:
-    from trezor.messages.CardanoGetPublicKey import CardanoGetPublicKey
+if TYPE_CHECKING:
+    from trezor.messages import CardanoGetPublicKey, CardanoPublicKey
 
 
 @seed.with_keychain
 async def get_public_key(
-    ctx: wire.Context, msg: CardanoGetPublicKey, keychain: seed.Keychain
+    msg: CardanoGetPublicKey, keychain: seed.Keychain
 ) -> CardanoPublicKey:
+    from trezor import log, wire
+    from trezor.ui.layouts import show_pubkey
+
+    from apps.common import paths
+
+    from .helpers.paths import SCHEMA_MINT, SCHEMA_PUBKEY
+
+    address_n = msg.address_n  # local_cache_attribute
+
     await paths.validate_path(
-        ctx,
         keychain,
-        msg.address_n,
+        address_n,
         # path must match the PUBKEY schema
-        SCHEMA_PUBKEY.match(msg.address_n),
+        SCHEMA_PUBKEY.match(address_n) or SCHEMA_MINT.match(address_n),
     )
 
     try:
-        key = _get_public_key(keychain, msg.address_n)
+        key = _get_public_key(keychain, address_n)
     except ValueError as e:
         if __debug__:
             log.exception(__name__, e)
         raise wire.ProcessError("Deriving public key failed")
 
     if msg.show_display:
-        await show_pubkey(ctx, hexlify(key.node.public_key).decode())
+        from apps.common.paths import address_n_to_str
+
+        path = address_n_to_str(address_n)
+        await show_pubkey(key.xpub, "Public key", path=path)
     return key
 
 
 def _get_public_key(
     keychain: seed.Keychain, derivation_path: list[int]
 ) -> CardanoPublicKey:
+    from trezor.messages import CardanoPublicKey, HDNodeType
+
+    from .helpers.utils import derive_public_key
+
     node = keychain.derive(derivation_path)
 
     public_key = hexlify(derive_public_key(keychain, derivation_path)).decode()

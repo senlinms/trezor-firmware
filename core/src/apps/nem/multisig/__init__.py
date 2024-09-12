@@ -1,32 +1,36 @@
-from trezor.messages.NEMAggregateModification import NEMAggregateModification
-from trezor.messages.NEMSignTx import NEMSignTx
-from trezor.messages.NEMTransactionCommon import NEMTransactionCommon
+from typing import TYPE_CHECKING
 
 from . import layout, serialize
 
+if TYPE_CHECKING:
+    from trezor.messages import (
+        NEMAggregateModification,
+        NEMSignTx,
+        NEMTransactionCommon,
+    )
 
-async def ask(ctx, msg: NEMSignTx):
-    await layout.ask_multisig(ctx, msg)
+
+async def ask(msg: NEMSignTx) -> None:
+    await layout.ask_multisig(msg)
 
 
-def initiate(public_key, common: NEMTransactionCommon, inner_tx: bytes) -> bytes:
+def initiate(public_key: bytes, common: NEMTransactionCommon, inner_tx: bytes) -> bytes:
     return serialize.serialize_multisig(common, public_key, inner_tx)
 
 
 def cosign(
-    public_key, common: NEMTransactionCommon, inner_tx: bytes, signer: bytes
+    public_key: bytes, common: NEMTransactionCommon, inner_tx: bytes, signer: bytes
 ) -> bytes:
     return serialize.serialize_multisig_signature(common, public_key, inner_tx, signer)
 
 
 async def aggregate_modification(
-    ctx,
     public_key: bytes,
     common: NEMTransactionCommon,
     aggr: NEMAggregateModification,
     multisig: bool,
-):
-    await layout.ask_aggregate_modification(ctx, common, aggr, multisig)
+) -> bytes:
+    await layout.ask_aggregate_modification(common, aggr, multisig)
     w = serialize.serialize_aggregate_modification(common, aggr, public_key)
 
     for m in aggr.modifications:

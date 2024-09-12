@@ -76,6 +76,8 @@ def poll(ifaces: Iterable[int], list_ref: list, timeout_ms: int) -> bool:
     `list_ref[0]` - the interface number, including the mask
     `list_ref[1]` - for touch event, tuple of:
                     (event_type, x_position, y_position)
+                  - for button event (T1), tuple of:
+                    (event type, button number)
                   - for USB read event, received bytes
     If timeout occurs, False is returned, True otherwise.
     """
@@ -188,12 +190,17 @@ class WebUSB:
         """
         Sends message using USB WebUSB (device) or UDP (emulator).
         """
+from . import fatfs, sdcard
 POLL_READ: int  # wait until interface is readable and return read data
 POLL_WRITE: int  # wait until interface is writable
 TOUCH: int  # interface id of the touch events
 TOUCH_START: int  # event id of touch start event
 TOUCH_MOVE: int  # event id of touch move event
 TOUCH_END: int  # event id of touch end event
+BUTTON: int  # interface id of button events
+BUTTON_PRESSED: int  # button down event
+BUTTON_RELEASED: int  # button up event
+BUTTON_LEFT: int  # button number of left button
+BUTTON_RIGHT: int  # button number of right button
+USB_CHECK: int # interface id for check of USB data connection
 WireInterface = Union[HID, WebUSB]
-if False:
-    from . import fatfs, sdcard

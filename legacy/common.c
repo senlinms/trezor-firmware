@@ -19,6 +19,7 @@
 
 #include "common.h"
 #include <stdio.h>
+#include <unistd.h>
 #include "bitmaps.h"
 #include "firmware/usb.h"
 #include "hmac_drbg.h"
@@ -83,23 +84,16 @@ void __assert_func(const char *file, int line, const char *func,
 }
 #endif
 
-void hal_delay(uint32_t ms) { usbSleep(ms); }
+void hal_delay(uint32_t ms) {
+#if EMULATOR
+  usleep(ms * 1000);
+#else
+  uint32_t start = timer_ms();
 
-void wait_random(void) {
-  int wait = random32() & 0xff;
-  volatile int i = 0;
-  volatile int j = wait;
-  while (i < wait) {
-    if (i + j != wait) {
-      shutdown();
-    }
-    ++i;
-    --j;
+  while ((timer_ms() - start) < ms) {
+    asm("nop");
   }
-  // Double-check loop completion.
-  if (i != wait || j != 0) {
-    shutdown();
-  }
+#endif
 }
 
 void drbg_init() {
@@ -120,4 +114,13 @@ uint32_t drbg_random32(void) {
   uint32_t value = 0;
   drbg_generate((uint8_t *)&value, sizeof(value));
   return value;
+}
+
+void show_wipe_code_screen(void) {
+  error_shutdown("You have entered the", "wipe code. All private",
+                 "data has been erased.", NULL);
+}
+void show_pin_too_many_screen(void) {
+  error_shutdown("Too many wrong PIN", "attempts. Storage has", "been wiped.",
+                 NULL);
 }

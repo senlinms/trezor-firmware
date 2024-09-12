@@ -1,84 +1,87 @@
-from trezor import ui
-from trezor.messages import (
-    BinanceCancelMsg,
-    BinanceInputOutput,
-    BinanceOrderMsg,
-    BinanceOrderSide,
-    BinanceTransferMsg,
-    ButtonRequestType,
-)
+from typing import TYPE_CHECKING, Sequence
+
+from trezor.enums import ButtonRequestType
 from trezor.strings import format_amount
-from trezor.ui.components.tt.scroll import Paginated
-from trezor.ui.components.tt.text import Text
+from trezor.ui.layouts import confirm_properties
 
-from apps.common.confirm import require_hold_to_confirm
-from apps.common.layout import split_address
+from .helpers import DECIMALS
 
-from . import helpers
+if TYPE_CHECKING:
+    from trezor.messages import (
+        BinanceCancelMsg,
+        BinanceInputOutput,
+        BinanceOrderMsg,
+        BinanceTransferMsg,
+    )
 
 
-async def require_confirm_transfer(ctx, msg: BinanceTransferMsg):
-    def make_input_output_pages(msg: BinanceInputOutput, direction):
-        pages = []
+async def require_confirm_transfer(msg: BinanceTransferMsg) -> None:
+    items: list[tuple[str, str, str]] = []
+
+    def make_input_output_pages(msg: BinanceInputOutput, direction: str) -> None:
         for coin in msg.coins:
-            coin_page = Text("Confirm " + direction, ui.ICON_SEND, icon_color=ui.GREEN)
-            coin_page.bold(
-                format_amount(coin.amount, helpers.DECIMALS) + " " + coin.denom
+            items.append(
+                (
+                    direction,
+                    format_amount(coin.amount, DECIMALS) + " " + coin.denom,
+                    msg.address,
+                )
             )
-            coin_page.normal("to")
-            coin_page.mono(*split_address(msg.address))
-            pages.append(coin_page)
 
-        return pages
-
-    pages = []
     for txinput in msg.inputs:
-        pages.extend(make_input_output_pages(txinput, "input"))
+        make_input_output_pages(txinput, "Confirm input")
 
     for txoutput in msg.outputs:
-        pages.extend(make_input_output_pages(txoutput, "output"))
+        make_input_output_pages(txoutput, "Confirm output")
 
-    return await require_hold_to_confirm(
-        ctx, Paginated(pages), ButtonRequestType.ConfirmOutput
+    await _confirm_transfer(items, chunkify=bool(msg.chunkify))
+
+
+async def _confirm_transfer(
+    inputs_outputs: Sequence[tuple[str, str, str]], chunkify: bool
+) -> None:
+    from trezor.ui.layouts import confirm_output
+
+    for index, (title, amount, address) in enumerate(inputs_outputs):
+        # Having hold=True on the last item
+        hold = index == len(inputs_outputs) - 1
+        await confirm_output(address, amount, title, hold=hold, chunkify=chunkify)
+
+
+async def require_confirm_cancel(msg: BinanceCancelMsg) -> None:
+    await confirm_properties(
+        "confirm_cancel",
+        "Confirm cancel",
+        (
+            ("Sender address:", str(msg.sender)),
+            ("Pair:", str(msg.symbol)),
+            ("Order ID:", str(msg.refid)),
+        ),
+        hold=True,
+        br_code=ButtonRequestType.SignTx,
     )
 
 
-async def require_confirm_cancel(ctx, msg: BinanceCancelMsg):
-    page1 = Text("Confirm cancel 1/2", ui.ICON_SEND, icon_color=ui.GREEN)
-    page1.normal("Sender address:")
-    page1.bold(msg.sender)
-    page1.normal("Pair:")
-    page1.bold(msg.symbol)
+async def require_confirm_order(msg: BinanceOrderMsg) -> None:
+    from trezor.enums import BinanceOrderSide
 
-    page2 = Text("Confirm cancel 2/2", ui.ICON_SEND, icon_color=ui.GREEN)
-    page2.normal("Order ID:")
-    page2.bold(msg.refid)
-
-    return await require_hold_to_confirm(
-        ctx, Paginated([page1, page2]), ButtonRequestType.SignTx
-    )
-
-
-async def require_confirm_order(ctx, msg: BinanceOrderMsg):
-    page1 = Text("Confirm order 1/3", ui.ICON_SEND, icon_color=ui.GREEN)
-    page1.normal("Sender address:")
-    page1.bold(msg.sender)
-
-    page2 = Text("Confirm order 2/3", ui.ICON_SEND, icon_color=ui.GREEN)
-    page2.normal("Pair:")
-    page2.bold(msg.symbol)
-    page2.normal("Side:")
     if msg.side == BinanceOrderSide.BUY:
-        page2.bold("Buy")
+        side = "Buy"
     elif msg.side == BinanceOrderSide.SELL:
-        page2.bold("Sell")
+        side = "Sell"
+    else:
+        side = "Unknown"
 
-    page3 = Text("Confirm order 3/3", ui.ICON_SEND, icon_color=ui.GREEN)
-    page3.normal("Quantity:")
-    page3.bold(format_amount(msg.quantity, helpers.DECIMALS))
-    page3.normal("Price:")
-    page3.bold(format_amount(msg.price, helpers.DECIMALS))
-
-    return await require_hold_to_confirm(
-        ctx, Paginated([page1, page2, page3]), ButtonRequestType.SignTx
+    await confirm_properties(
+        "confirm_order",
+        "Confirm order",
+        (
+            ("Sender address:", str(msg.sender)),
+            ("Pair:", str(msg.symbol)),
+            ("Side:", side),
+            ("Quantity:", format_amount(msg.quantity, DECIMALS)),
+            ("Price:", format_amount(msg.price, DECIMALS)),
+        ),
+        hold=True,
+        br_code=ButtonRequestType.SignTx,
     )

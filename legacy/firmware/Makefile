@@ -2,6 +2,37 @@ APPVER = 1.8.0
 
 NAME  = trezor
 
+SECP256K1_ZKP ?= 1
+
+
+ifeq ($(SECP256K1_ZKP),1)
+CFLAGS   += -DUSE_SECP256K1_ZKP
+CFLAGS   += -DUSE_SECP256K1_ZKP_ECDSA
+ifeq ($(EMULATOR),1)
+CFLAGS += -DSECP256K1_CONTEXT_SIZE=208
+else
+CFLAGS += -DSECP256K1_CONTEXT_SIZE=180
+OBJS += field_10x26_arm.o
+endif
+ZKP_CFLAGS = \
+	-DUSE_ASM_ARM \
+	-DUSE_EXTERNAL_ASM \
+	-DUSE_EXTERNAL_DEFAULT_CALLBACKS \
+	-DECMULT_GEN_PREC_BITS=4 \
+	-DECMULT_WINDOW_SIZE=8 \
+	-DENABLE_MODULE_GENERATOR \
+	-DENABLE_MODULE_RECOVERY \
+	-DENABLE_MODULE_SCHNORRSIG \
+	-DENABLE_MODULE_EXTRAKEYS
+
+OBJS += secp256k1-zkp.o
+OBJS += precomputed_ecmult.o
+OBJS += precomputed_ecmult_gen.o
+OBJS += ../vendor/trezor-crypto/zkp_bip340.o
+OBJS += ../vendor/trezor-crypto/zkp_context.o
+OBJS += ../vendor/trezor-crypto/zkp_ecdsa.o
+endif
+
 ifeq ($(EMULATOR),1)
 OBJS += udp.o
 else
@@ -9,6 +40,7 @@ OBJS += usb.o
 OBJS += bl_check.o
 OBJS += otp.o
 OBJS += header.o
+OBJS += startup.o
 endif
 
 OBJS += messages.o
@@ -29,8 +61,9 @@ OBJS += crypto.o
 ifneq ($(BITCOIN_ONLY),1)
 OBJS += u2f.o
 OBJS += ethereum.o
+OBJS += ethereum_definitions.o
+OBJS += ethereum_networks.o
 OBJS += ethereum_tokens.o
-OBJS += lisk.o
 OBJS += nem2.o
 OBJS += nem_mosaics.o
 OBJS += stellar.o
@@ -63,17 +96,18 @@ OBJS += ../vendor/trezor-crypto/ed25519-donna/ed25519-keccak.o
 OBJS += ../vendor/trezor-crypto/hmac.o
 OBJS += ../vendor/trezor-crypto/bip32.o
 OBJS += ../vendor/trezor-crypto/bip39.o
+OBJS += ../vendor/trezor-crypto/bip39_english.o
 OBJS += ../vendor/trezor-crypto/pbkdf2.o
 OBJS += ../vendor/trezor-crypto/base32.o
 OBJS += ../vendor/trezor-crypto/base58.o
 OBJS += ../vendor/trezor-crypto/segwit_addr.o
-OBJS += ../vendor/trezor-crypto/cash_addr.o
 
 OBJS += ../vendor/trezor-crypto/ripemd160.o
 OBJS += ../vendor/trezor-crypto/sha2.o
 OBJS += ../vendor/trezor-crypto/sha3.o
 OBJS += ../vendor/trezor-crypto/blake256.o
 OBJS += ../vendor/trezor-crypto/blake2b.o
+OBJS += ../vendor/trezor-crypto/blake2s.o
 OBJS += ../vendor/trezor-crypto/groestl.o
 OBJS += ../vendor/trezor-crypto/hasher.o
 
@@ -104,9 +138,11 @@ OBJS += protob/messages-common.pb.o
 OBJS += protob/messages-crypto.pb.o
 OBJS += protob/messages-debug.pb.o
 OBJS += protob/messages-management.pb.o
+
 ifneq ($(BITCOIN_ONLY),1)
+OBJS += ../vendor/trezor-crypto/cash_addr.o
 OBJS += protob/messages-ethereum.pb.o
-OBJS += protob/messages-lisk.pb.o
+OBJS += protob/messages-ethereum-definitions.pb.o
 OBJS += protob/messages-nem.pb.o
 OBJS += protob/messages-stellar.pb.o
 endif
@@ -121,15 +157,12 @@ OPTFLAGS ?= -Os
 
 include ../Makefile.include
 
-DEBUG_LINK ?= 0
-DEBUG_LOG  ?= 0
 
 CFLAGS += -Wno-sequence-point
 CFLAGS += -I../vendor/nanopb -Iprotob -DPB_FIELD_16BIT=1 -DPB_ENCODE_ARRAYS_UNPACKED=1 -DPB_VALIDATE_UTF8=1
-CFLAGS += -DDEBUG_LINK=$(DEBUG_LINK)
-CFLAGS += -DDEBUG_LOG=$(DEBUG_LOG)
 CFLAGS += -DSCM_REVISION='"$(shell git rev-parse HEAD | sed 's:\(..\):\\x\1:g')"'
 CFLAGS += -DUSE_MONERO=0
+CFLAGS += -DUSE_OPTIGA=0
 ifneq ($(BITCOIN_ONLY),1)
 CFLAGS += -DUSE_ETHEREUM=1
 CFLAGS += -DUSE_NEM=1
@@ -144,9 +177,17 @@ endif
 	@printf "  MAKO    $@\n"
 	$(Q)$(PYTHON) ../vendor/trezor-common/tools/cointool.py render $(MAKO_RENDER_FLAG) $@.mako
 
+ifeq ($(BOOTLOADER_QA), 0)
 bl_data.h: bl_data.py bootloader.dat
-	@printf "  PYTHON  bl_data.py\n"
-	$(Q)$(PYTHON) bl_data.py
+	@printf "  PYTHON  bl_data.py bootloader.dat\n"
+	$(Q)$(PYTHON) bl_data.py bootloader.dat
+else
+bl_data.h: bl_data.py bootloader_qa.dat
+	@printf "  PYTHON  bl_data.py bootloader_qa.dat\n"
+	$(Q)$(PYTHON) bl_data.py bootloader_qa.dat
+endif
+
+header.o: version.h
 
 clean::
 	rm -f bl_data.h

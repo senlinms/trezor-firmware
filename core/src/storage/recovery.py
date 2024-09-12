@@ -10,13 +10,13 @@ _NAMESPACE = common.APP_RECOVERY
 _IN_PROGRESS               = const(0x00)  # bool
 _DRY_RUN                   = const(0x01)  # bool
 _SLIP39_IDENTIFIER         = const(0x03)  # bytes
-_SLIP39_THRESHOLD          = const(0x04)  # int
 _REMAINING                 = const(0x05)  # int
 _SLIP39_ITERATION_EXPONENT = const(0x06)  # int
 _SLIP39_GROUP_COUNT        = const(0x07)  # int
 
 # Deprecated Keys:
 # _WORD_COUNT                = const(0x02)  # int
+# _SLIP39_THRESHOLD          = const(0x04)  # int
 # fmt: on
 
 # Default values:
@@ -126,11 +126,14 @@ def end_progress() -> None:
     from . import recovery_shares
 
     _require_progress()
-    common.delete(_NAMESPACE, _IN_PROGRESS)
-    common.delete(_NAMESPACE, _DRY_RUN)
-    common.delete(_NAMESPACE, _SLIP39_IDENTIFIER)
-    common.delete(_NAMESPACE, _SLIP39_THRESHOLD)
-    common.delete(_NAMESPACE, _REMAINING)
-    common.delete(_NAMESPACE, _SLIP39_ITERATION_EXPONENT)
-    common.delete(_NAMESPACE, _SLIP39_GROUP_COUNT)
+    for key in (
+        _IN_PROGRESS,
+        _DRY_RUN,
+        _SLIP39_IDENTIFIER,
+        _REMAINING,
+        _SLIP39_ITERATION_EXPONENT,
+        _SLIP39_GROUP_COUNT,
+    ):
+        common.delete(_NAMESPACE, key)
+
     recovery_shares.delete()

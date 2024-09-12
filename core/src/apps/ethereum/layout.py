@@ -1,77 +1,248 @@
-from ubinascii import hexlify
+from typing import TYPE_CHECKING
 
 from trezor import ui
-from trezor.messages import ButtonRequestType
-from trezor.strings import format_amount
-from trezor.ui.components.tt.text import Text
-from trezor.utils import chunks
+from trezor.enums import ButtonRequestType
+from trezor.strings import format_plural
+from trezor.ui.layouts import (
+    confirm_blob,
+    confirm_ethereum_tx,
+    confirm_text,
+    should_show_more,
+)
 
-from apps.common.confirm import require_confirm, require_hold_to_confirm
-from apps.common.layout import split_address
+from .helpers import address_from_bytes, decode_typed_data
 
-from . import networks, tokens
-from .address import address_from_bytes
+if TYPE_CHECKING:
+    from typing import Awaitable, Iterable
+
+    from trezor.messages import (
+        EthereumFieldType,
+        EthereumNetworkInfo,
+        EthereumStructMember,
+        EthereumTokenInfo,
+    )
 
 
-async def require_confirm_tx(ctx, to_bytes, value, chain_id, token=None, tx_type=None):
+async def require_confirm_tx(
+    to_bytes: bytes,
+    value: int,
+    gas_price: int,
+    gas_limit: int,
+    network: EthereumNetworkInfo,
+    token: EthereumTokenInfo | None,
+) -> None:
     if to_bytes:
-        to_str = address_from_bytes(to_bytes, networks.by_chain_id(chain_id))
+        to_str = address_from_bytes(to_bytes, network)
     else:
         to_str = "new contract?"
-    text = Text("Confirm sending", ui.ICON_SEND, ui.GREEN, new_lines=False)
-    text.bold(format_ethereum_amount(value, token, chain_id, tx_type))
-    text.normal(ui.GREY, " to ", ui.FG)
-    for to_line in split_address(to_str):
-        text.br()
-        text.mono(to_line)
-    # we use SignTx, not ConfirmOutput, for compatibility with T1
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
+
+    total_amount = format_ethereum_amount(value, token, network)
+    maximum_fee = format_ethereum_amount(gas_price * gas_limit, None, network)
+    gas_limit_str = f"{gas_limit} units"
+    gas_price_str = format_ethereum_amount(gas_price, None, network)
+
+    items = (
+        ("Gas limit:", gas_limit_str),
+        ("Gas price:", gas_price_str),
+    )
+
+    await confirm_ethereum_tx(to_str, total_amount, maximum_fee, items)
 
 
-async def require_confirm_fee(
-    ctx, spending, gas_price, gas_limit, chain_id, token=None, tx_type=None
-):
-    text = Text("Confirm transaction", ui.ICON_SEND, ui.GREEN, new_lines=False)
-    text.bold(format_ethereum_amount(spending, token, chain_id, tx_type))
-    text.normal(" ", ui.GREY, "Gas price:", ui.FG)
-    text.bold(format_ethereum_amount(gas_price, None, chain_id, tx_type))
-    text.normal(" ", ui.GREY, "Maximum fee:", ui.FG)
-    text.bold(format_ethereum_amount(gas_price * gas_limit, None, chain_id, tx_type))
-    await require_hold_to_confirm(ctx, text, ButtonRequestType.SignTx)
+async def require_confirm_tx_eip1559(
+    to_bytes: bytes,
+    value: int,
+    max_gas_fee: int,
+    max_priority_fee: int,
+    gas_limit: int,
+    network: EthereumNetworkInfo,
+    token: EthereumTokenInfo | None,
+) -> None:
 
-
-async def require_confirm_unknown_token(ctx, address_bytes):
-    text = Text("Unknown token", ui.ICON_SEND, ui.ORANGE, new_lines=False)
-    text.normal(ui.GREY, "Contract:", ui.FG)
-    contract_address_hex = "0x" + hexlify(address_bytes).decode()
-    text.mono(*split_data(contract_address_hex))
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
-
-
-def split_data(data):
-    return chunks(data, 18)
-
-
-async def require_confirm_data(ctx, data, data_total):
-    data_str = hexlify(data[:36]).decode()
-    if data_total > 36:
-        data_str = data_str[:-2] + ".."
-    text = Text("Confirm data", ui.ICON_SEND, ui.GREEN)
-    text.bold("Size: %d bytes" % data_total)
-    text.mono(*split_data(data_str))
-    # we use SignTx, not ConfirmOutput, for compatibility with T1
-    await require_confirm(ctx, text, ButtonRequestType.SignTx)
-
-
-def format_ethereum_amount(value: int, token, chain_id: int, tx_type=None):
-    if token is tokens.UNKNOWN_TOKEN:
-        suffix = "Wei UNKN"
-        decimals = 0
-    elif token:
-        suffix = token[2]
-        decimals = token[3]
+    if to_bytes:
+        to_str = address_from_bytes(to_bytes, network)
     else:
-        suffix = networks.shortcut_by_chain_id(chain_id, tx_type)
+        to_str = "new contract?"
+
+    total_amount = format_ethereum_amount(value, token, network)
+    maximum_fee = format_ethereum_amount(max_gas_fee * gas_limit, None, network)
+    gas_limit_str = f"{gas_limit} units"
+    max_gas_fee_str = format_ethereum_amount(max_gas_fee, None, network)
+    max_priority_fee_str = format_ethereum_amount(max_priority_fee, None, network)
+
+    items = (
+        ("Gas limit:", gas_limit_str),
+        ("Max gas price:", max_gas_fee_str),
+        ("Priority fee:", max_priority_fee_str),
+    )
+
+    await confirm_ethereum_tx(to_str, total_amount, maximum_fee, items)
+
+
+def require_confirm_unknown_token(address_bytes: bytes) -> Awaitable[None]:
+    from ubinascii import hexlify
+
+    from trezor.ui.layouts import confirm_address
+
+    contract_address_hex = "0x" + hexlify(address_bytes).decode()
+    return confirm_address(
+        "Unknown token",
+        contract_address_hex,
+        "Contract:",
+        "unknown_token",
+        br_code=ButtonRequestType.SignTx,
+    )
+
+
+def require_confirm_address(address_bytes: bytes) -> Awaitable[None]:
+    from ubinascii import hexlify
+
+    from trezor.ui.layouts import confirm_address
+
+    address_hex = "0x" + hexlify(address_bytes).decode()
+    return confirm_address(
+        "Signing address",
+        address_hex,
+        br_code=ButtonRequestType.SignTx,
+    )
+
+
+def require_confirm_data(data: bytes, data_total: int) -> Awaitable[None]:
+    return confirm_blob(
+        "confirm_data",
+        "Confirm data",
+        data,
+        f"Size: {data_total} bytes",
+        br_code=ButtonRequestType.SignTx,
+        ask_pagination=True,
+    )
+
+
+async def confirm_typed_data_final() -> None:
+    from trezor.ui.layouts import confirm_action
+
+    await confirm_action(
+        "confirm_typed_data_final",
+        "Confirm typed data",
+        "Really sign EIP-712 typed data?",
+        verb="Hold to confirm",
+        hold=True,
+    )
+
+
+def confirm_empty_typed_message() -> Awaitable[None]:
+    return confirm_text(
+        "confirm_empty_typed_message",
+        "Confirm message",
+        "",
+        "No message field",
+    )
+
+
+async def should_show_domain(name: bytes, version: bytes) -> bool:
+    domain_name = decode_typed_data(name, "string")
+    domain_version = decode_typed_data(version, "string")
+
+    para = (
+        (ui.NORMAL, "Name and version"),
+        (ui.DEMIBOLD, domain_name),
+        (ui.DEMIBOLD, domain_version),
+    )
+    return await should_show_more(
+        "Confirm domain",
+        para,
+        "Show full domain",
+        "should_show_domain",
+    )
+
+
+async def should_show_struct(
+    description: str,
+    data_members: list[EthereumStructMember],
+    title: str = "Confirm struct",
+    button_text: str = "Show full struct",
+) -> bool:
+    para = (
+        (ui.DEMIBOLD, description),
+        (
+            ui.NORMAL,
+            format_plural("Contains {count} {plural}", len(data_members), "key"),
+        ),
+        (ui.NORMAL, ", ".join(field.name for field in data_members)),
+    )
+    return await should_show_more(
+        title,
+        para,
+        button_text,
+        "should_show_struct",
+    )
+
+
+async def should_show_array(
+    parent_objects: Iterable[str],
+    data_type: str,
+    size: int,
+) -> bool:
+    para = ((ui.NORMAL, format_plural("Array of {count} {plural}", size, data_type)),)
+    return await should_show_more(
+        limit_str(".".join(parent_objects)),
+        para,
+        "Show full array",
+        "should_show_array",
+    )
+
+
+async def confirm_typed_value(
+    name: str,
+    value: bytes,
+    parent_objects: list[str],
+    field: EthereumFieldType,
+    array_index: int | None = None,
+) -> None:
+    from trezor.enums import EthereumDataType
+
+    from .helpers import get_type_name
+
+    type_name = get_type_name(field)
+
+    if array_index is not None:
+        title = limit_str(".".join(parent_objects + [name]))
+        description = f"[{array_index}] ({type_name})"
+    else:
+        title = limit_str(".".join(parent_objects))
+        description = f"{name} ({type_name})"
+
+    data = decode_typed_data(value, type_name)
+
+    if field.data_type in (EthereumDataType.ADDRESS, EthereumDataType.BYTES):
+        await confirm_blob(
+            "confirm_typed_value",
+            title,
+            data,
+            description,
+            ask_pagination=True,
+        )
+    else:
+        await confirm_text(
+            "confirm_typed_value",
+            title,
+            data,
+            description,
+        )
+
+
+def format_ethereum_amount(
+    value: int,
+    token: EthereumTokenInfo | None,
+    network: EthereumNetworkInfo,
+) -> str:
+    from trezor.strings import format_amount
+
+    if token:
+        suffix = token.symbol
+        decimals = token.decimals
+    else:
+        suffix = network.symbol
         decimals = 18
 
     # Don't want to display wei values for tokens with small decimal numbers
@@ -79,4 +250,12 @@ def format_ethereum_amount(value: int, token, chain_id: int, tx_type=None):
         suffix = "Wei " + suffix
         decimals = 0
 
-    return "%s %s" % (format_amount(value, decimals), suffix)
+    return f"{format_amount(value, decimals)} {suffix}"
+
+
+def limit_str(s: str, limit: int = 16) -> str:
+    """Shortens string to show the last <limit> characters."""
+    if len(s) <= limit + 2:
+        return s
+
+    return ".." + s[-limit:]

@@ -1,18 +1,11 @@
 {
-    "erc20:eth:BTL (Battle)": true,
-    "erc20:eth:BTL (Bitlle)": true,
-    "erc20:eth:LINK Platform": true,
-    "erc20:eth:NXX": false,
-    "erc20:eth:Hdp": true,
-    "erc20:eth:Hdp.ф": true,
+    "erc20:eth:MATIC": false,
+    "erc20:eth:USDT": false,
+    "eth:BNB:56": false,
+    "eth:MATIC:137": false,
+    "eth:tETH:3": false,
+    "eth:tETH:4": false,
+    "eth:tETH:5": false,
     "misc:BNB": false,
-    "eth:BNB": false,
-    "eth:ONE:1666600000": false,
-    "eth:ONE:1666600001": false,
-    "eth:ONE:1666600002": false,
-    "eth:ONE:1666600003": false,
-    "eth:tGOR:5": false,
-    "eth:tGOR:420": false,
-    "eth:tCELO:44787": false,
-    "eth:tCELO:62320": false
+    "misc:USDT": false
 }

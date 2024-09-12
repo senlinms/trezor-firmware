@@ -15,12 +15,27 @@
 # If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.
 
 import json
+import re
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Generator, Optional
+from unittest import mock
 
 import pytest
 
-from trezorlib import btc, tools
-from trezorlib.messages import ButtonRequestType as B
+from trezorlib import btc, messages, tools
+from trezorlib.messages import ButtonRequestType
+
+if TYPE_CHECKING:
+    from _pytest.mark.structures import MarkDecorator
+
+    from trezorlib.debuglink import DebugLink
+    from trezorlib.debuglink import TrezorClientDebugLink as Client
+    from trezorlib.messages import ButtonRequest
+
+
+BRGeneratorType = Generator[None, messages.ButtonRequest, None]
+
 
 # fmt: off
 #                1      2     3    4      5      6      7     8      9    10    11    12
@@ -49,11 +64,15 @@ EXTERNAL_ENTROPY = b"zlutoucky kun upel divoke ody" * 2
 
 TEST_ADDRESS_N = tools.parse_path("m/44h/1h/0h/0/0")
 COMMON_FIXTURES_DIR = (
-    Path(__file__).parent.resolve().parent / "common" / "tests" / "fixtures"
+    Path(__file__).resolve().parent.parent / "common" / "tests" / "fixtures"
 )
 
+# So that all the random things are consistent
+MOCK_OS_URANDOM = mock.Mock(return_value=EXTERNAL_ENTROPY)
+WITH_MOCK_URANDOM = mock.patch("os.urandom", MOCK_OS_URANDOM)
 
-def parametrize_using_common_fixtures(*paths):
+
+def parametrize_using_common_fixtures(*paths: str) -> "MarkDecorator":
     fixtures = []
     for path in paths:
         fixtures.append(json.loads((COMMON_FIXTURES_DIR / path).read_text()))
@@ -82,7 +101,9 @@ def parametrize_using_common_fixtures(*paths):
     return pytest.mark.parametrize("parameters, result", tests)
 
 
-def generate_entropy(strength, internal_entropy, external_entropy):
+def generate_entropy(
+    strength: int, internal_entropy: bytes, external_entropy: bytes
+) -> bytes:
     """
     strength - length of produced seed. One of 128, 192, 256
     random - binary stream of random data from external HRNG
@@ -113,49 +134,9 @@ def generate_entropy(strength, internal_entropy, external_entropy):
     return entropy_stripped
 
 
-def recovery_enter_shares(debug, shares, groups=False):
-    """Perform the recovery flow for a set of Shamir shares.
-
-    For use in an input flow function.
-    Example:
-
-    def input_flow():
-        yield  # start recovery
-        client.debug.press_yes()
-        yield from recovery_enter_shares(client.debug, SOME_SHARES)
-    """
-    word_count = len(shares[0].split(" "))
-
-    # Homescreen - proceed to word number selection
-    yield
-    debug.press_yes()
-    # Input word number
-    code = yield
-    assert code == B.MnemonicWordCount
-    debug.input(str(word_count))
-    # Homescreen - proceed to share entry
-    yield
-    debug.press_yes()
-    # Enter shares
-    for index, share in enumerate(shares):
-        code = yield
-        assert code == B.MnemonicInput
-        # Enter mnemonic words
-        for word in share.split(" "):
-            debug.input(word)
-
-        if groups:
-            # Confirm share entered
-            yield
-            debug.press_yes()
-
-        # Homescreen - continue
-        # or Homescreen - confirm success
-        yield
-        debug.press_yes()
-
-
-def click_through(debug, screens, code=None):
+def click_through(
+    debug: "DebugLink", screens: int, code: Optional[ButtonRequestType] = None
+) -> Generator[None, "ButtonRequest", None]:
     """Click through N dialog screens.
 
     For use in an input flow function.
@@ -166,16 +147,32 @@ def click_through(debug, screens, code=None):
         # 2. Backup your seed
         # 3. Confirm warning
         # 4. Shares info
-        yield from click_through(client.debug, screens=4, code=B.ResetDevice)
+        yield from click_through(client.debug, screens=4, code=ButtonRequestType.ResetDevice)
     """
     for _ in range(screens):
         received = yield
         if code is not None:
-            assert received == code
+            assert received.code == code
         debug.press_yes()
 
 
-def read_and_confirm_mnemonic(debug, words, choose_wrong=False):
+def read_and_confirm_mnemonic(
+    debug: "DebugLink", choose_wrong: bool = False
+) -> Generator[None, "ButtonRequest", Optional[str]]:
+    # TODO: these are very similar, reuse some code
+    if debug.model == "T":
+        mnemonic = yield from read_and_confirm_mnemonic_tt(debug, choose_wrong)
+    elif debug.model == "Safe 3":
+        mnemonic = yield from read_and_confirm_mnemonic_tr(debug, choose_wrong)
+    else:
+        raise ValueError(f"Unknown model: {debug.model}")
+
+    return mnemonic
+
+
+def read_and_confirm_mnemonic_tt(
+    debug: "DebugLink", choose_wrong: bool = False
+) -> Generator[None, "ButtonRequest", Optional[str]]:
     """Read a given number of mnemonic words from Trezor T screen and correctly
     answer confirmation questions. Return the full mnemonic.
 
@@ -185,22 +182,27 @@ def read_and_confirm_mnemonic(debug, words, choose_wrong=False):
     def input_flow():
         yield from click_through(client.debug, screens=3)
 
-        yield  # confirm mnemonic entry
-        mnemonic = read_and_confirm_mnemonic(client.debug, words=20)
+        mnemonic = yield from read_and_confirm_mnemonic(client.debug)
     """
-    mnemonic = []
-    while True:
-        mnemonic.extend(debug.read_reset_word().split())
-        if len(mnemonic) < words:
+    mnemonic: list[str] = []
+    br = yield
+    assert br.pages is not None
+
+    debug.wait_layout()
+
+    for i in range(br.pages):
+        words = debug.wait_layout().seed_words()
+        mnemonic.extend(words)
+        # Not swiping on the last page
+        if i < br.pages - 1:
             debug.swipe_up()
-        else:
-            # last page is confirmation
-            debug.press_yes()
-            break
+
+    debug.press_yes()
 
     # check share
     for _ in range(3):
-        index = debug.read_reset_word_pos()
+        word_pos = int(debug.wait_layout().text_content().split()[2])
+        index = word_pos - 1
         if choose_wrong:
             debug.input(mnemonic[(index + 1) % len(mnemonic)])
             return None
@@ -210,7 +212,65 @@ def read_and_confirm_mnemonic(debug, words, choose_wrong=False):
     return " ".join(mnemonic)
 
 
-def get_test_address(client):
+def read_and_confirm_mnemonic_tr(
+    debug: "DebugLink", choose_wrong: bool = False
+) -> Generator[None, "ButtonRequest", Optional[str]]:
+    mnemonic: list[str] = []
+    yield  # write down all 12 words in order
+    debug.press_yes()
+    br = yield
+    assert br.pages is not None
+    for _ in range(br.pages - 1):
+        layout = debug.wait_layout()
+        words = layout.seed_words()
+        mnemonic.extend(words)
+        debug.press_right()
+    debug.press_yes()
+
+    yield  # Select correct words...
+    debug.press_right()
+
+    # check share
+    for _ in range(3):
+        word_pos_match = re.search(r"\d+", debug.wait_layout().title())
+        assert word_pos_match is not None
+        word_pos = int(word_pos_match.group(0))
+        index = word_pos - 1
+        if choose_wrong:
+            debug.input(mnemonic[(index + 1) % len(mnemonic)])
+            return None
+        else:
+            debug.input(mnemonic[index])
+
+    return " ".join(mnemonic)
+
+
+def click_info_button_tt(debug: "DebugLink"):
+    """Click Shamir backup info button and return back."""
+    debug.press_info()
+    yield  # Info screen with text
+    debug.press_yes()
+
+
+def check_pin_backoff_time(attempts: int, start: float) -> None:
+    """Helper to assert the exponentially growing delay after incorrect PIN attempts"""
+    expected = (2**attempts) - 1
+    got = round(time.time() - start, 2)
+    assert got >= expected
+
+
+def get_test_address(client: "Client") -> str:
     """Fetch a testnet address on a fixed path. Useful to make a pin/passphrase
     protected call, or to identify the root secret (seed+passphrase)"""
     return btc.get_address(client, "Testnet", TEST_ADDRESS_N)
+
+
+def compact_size(n) -> bytes:
+    if n < 253:
+        return n.to_bytes(1, "little")
+    elif n < 0x1_0000:
+        return bytes([253]) + n.to_bytes(2, "little")
+    elif n < 0x1_0000_0000:
+        return bytes([254]) + n.to_bytes(4, "little")
+    else:
+        return bytes([255]) + n.to_bytes(8, "little")

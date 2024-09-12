@@ -7,7 +7,8 @@ SCONS = scons -Q -j $(JOBS)
 BUILD_DIR             = build
 BOARDLOADER_BUILD_DIR = $(BUILD_DIR)/boardloader
 BOOTLOADER_BUILD_DIR  = $(BUILD_DIR)/bootloader
-BOOTLOADER_CI_BUILD_DIR  = $(BUILD_DIR)/bootloader_ci
+BOOTLOADER_CI_BUILD_DIR   = $(BUILD_DIR)/bootloader_ci
+BOOTLOADER_EMU_BUILD_DIR  = $(BUILD_DIR)/bootloader_emu
 PRODTEST_BUILD_DIR    = $(BUILD_DIR)/prodtest
 REFLASH_BUILD_DIR     = $(BUILD_DIR)/reflash
 FIRMWARE_BUILD_DIR    = $(BUILD_DIR)/firmware
@@ -21,11 +22,18 @@ CROSS_PORT_OPTS ?=
 PRODUCTION ?= 0
 PYOPT      ?= 1
 BITCOIN_ONLY ?= 0
+BOOTLOADER_QA ?= 0
+BOOTLOADER_DEVEL ?= 0
 TREZOR_MODEL ?= T
 TREZOR_MEMPERF ?= 0
+ADDRESS_SANITIZER ?= 0
+CMAKELISTS ?= 0
+PYTEST_TIMEOUT ?= 400
 
-OPENOCD_INTERFACE ?= stlink   # -or- ftdi/olimex-arm-usb-tiny-h
-OPENOCD_TRANSPORT ?= hla_swd  # -or- jtag
+# OpenOCD interface default. Alternative: ftdi/olimex-arm-usb-tiny-h
+OPENOCD_INTERFACE ?= stlink
+# OpenOCD transport default. Alternative: jtag
+OPENOCD_TRANSPORT ?= hla_swd
 OPENOCD = openocd -f interface/$(OPENOCD_INTERFACE).cfg -c "transport select $(OPENOCD_TRANSPORT)" -f target/stm32f4x.cfg
 OPENOCD_T1 = openocd -f interface/$(OPENOCD_INTERFACE).cfg -c "transport select $(OPENOCD_TRANSPORT)" -f target/stm32f2x.cfg
 
@@ -42,8 +50,7 @@ FIRMWARE_P1_MAXSIZE = 786432
 FIRMWARE_P2_MAXSIZE = 917504
 FIRMWARE_MAXSIZE    = 1703936
 
-GITREV=$(shell git describe --always --dirty | tr '-' '_')
-CFLAGS += -DGITREV=$(GITREV)
+CFLAGS += -DSCM_REVISION='\"$(shell git rev-parse HEAD | sed 's:\(..\):\\x\1:g')\"'
 
 TESTPATH = $(CURDIR)/../tests
 
@@ -55,6 +62,9 @@ EMU_TEST = $(EMU) $(EMU_TEST_ARGS) -c
 JUNIT_XML ?= $(TESTPATH)/junit.xml
 PYTEST = pytest --junitxml=$(JUNIT_XML)
 TREZOR_FIDO2_UDP_PORT = 21326
+RUST_TARGET=$(shell rustc -vV | sed -n 's/host: //p')
+
+MULTICORE ?= "auto"
 
 ## help commands:
 
@@ -79,8 +89,17 @@ emu: ## run emulator
 test: ## run unit tests
 	cd tests ; ./run_tests.sh $(TESTOPTS)
 
+test_rust: ## run rs unit tests
+	cd embed/rust ; cargo test $(TESTOPTS) --target=$(RUST_TARGET) \
+		--no-default-features --features model_t$(shell echo $(TREZOR_MODEL) | tr "TR" "tr"),test \
+		-- --test-threads=1 --nocapture
+
 test_emu: ## run selected device tests from python-trezor
 	$(EMU_TEST) $(PYTEST) $(TESTPATH)/device_tests $(TESTOPTS)
+
+test_emu_multicore: ## run device tests using multiple cores
+	$(PYTEST) -n $(MULTICORE) $(TESTPATH)/device_tests $(TESTOPTS) --timeout $(PYTEST_TIMEOUT) \
+		--control-emulators --model=core --random-order-seed=$(shell echo $$RANDOM)
 
 test_emu_monero: ## run selected monero device tests from monero-agent
 	cd tests ; $(EMU_TEST) ./run_tests_device_emu_monero.sh $(TESTOPTS)
@@ -96,22 +115,48 @@ test_emu_fido2: ## run fido2 device tests
 test_emu_click: ## run click tests
 	$(EMU_TEST) $(PYTEST) $(TESTPATH)/click_tests $(TESTOPTS)
 
+test_emu_click_ui: ## run click tests with UI testing
+	$(EMU_TEST) $(PYTEST) $(TESTPATH)/click_tests $(TESTOPTS) \
+		--ui=test --ui-check-missing --do-master-diff
+
+test_emu_persistence: ## run persistence tests
+	$(PYTEST) $(TESTPATH)/persistence_tests $(TESTOPTS)
+
+test_emu_persistence_ui: ## run persistence tests with UI testing
+	$(PYTEST) $(TESTPATH)/persistence_tests $(TESTOPTS) \
+		--ui=test --ui-check-missing --do-master-diff
+
 test_emu_ui: ## run ui integration tests
-	$(EMU_TEST) $(PYTEST) $(TESTPATH)/device_tests --ui=test --ui-check-missing -m "not skip_ui" $(TESTOPTS)
+	$(EMU_TEST) $(PYTEST) $(TESTPATH)/device_tests $(TESTOPTS) \
+		--ui=test --ui-check-missing --record-text-layout --do-master-diff
+
+test_emu_ui_multicore: ## run ui integration tests using multiple cores
+	$(PYTEST) -n $(MULTICORE) $(TESTPATH)/device_tests $(TESTOPTS) --timeout $(PYTEST_TIMEOUT) \
+		--ui=test --ui-check-missing --record-text-layout --do-master-diff \
+		--control-emulators --model=core --random-order-seed=$(shell echo $$RANDOM)
 
 test_emu_ui_record: ## record and hash screens for ui integration tests
-	$(EMU_TEST) $(PYTEST) $(TESTPATH)/device_tests --ui=record --ui-check-missing -m "not skip_ui" $(TESTOPTS)
+	$(EMU_TEST) $(PYTEST) $(TESTPATH)/device_tests $(TESTOPTS) \
+		--ui=record --ui-check-missing --do-master-diff
+
+test_emu_ui_record_multicore: ## quickly record all screens
+	make test_emu_ui_multicore || echo "All errors are recorded in fixtures.json"
+	../tests/update_fixtures.py local -r
 
 pylint: ## run pylint on application sources and tests
 	pylint -E $(shell find src tests -name *.py)
 
-mypy:
-	mypy --config-file ../setup.cfg \
-		src/main.py \
-		src/apps/bitcoin \
-		src/apps/cardano \
-		src/apps/misc \
-		src/apps/webauthn
+mypy: ## deprecated; use "make typecheck"
+	@echo "mypy is deprecated; use 'make typecheck'"
+	make typecheck
+
+typecheck: pyright
+
+pyright:
+	python ../tools/pyright_tool.py
+
+clippy:
+	cd embed/rust ; cargo clippy --all-features --target=$(RUST_TARGET)
 
 ## code generation:
 
@@ -128,40 +173,58 @@ build: build_boardloader build_bootloader build_firmware build_prodtest build_un
 build_embed: build_boardloader build_bootloader build_firmware # build boardloader, bootloader, firmware
 
 build_boardloader: ## build boardloader
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" $(BOARDLOADER_BUILD_DIR)/boardloader.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" \
+		CMAKELISTS="$(CMAKELISTS)" $(BOARDLOADER_BUILD_DIR)/boardloader.bin
 
 build_bootloader: ## build bootloader
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" $(BOOTLOADER_BUILD_DIR)/bootloader.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" \
+		CMAKELISTS="$(CMAKELISTS)" BOOTLOADER_QA="$(BOOTLOADER_QA)" BOOTLOADER_DEVEL="$(BOOTLOADER_DEVEL)" $(BOOTLOADER_BUILD_DIR)/bootloader.bin
 
 build_bootloader_ci: ## build CI device testing bootloader
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" $(BOOTLOADER_CI_BUILD_DIR)/bootloader.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" \
+		CMAKELISTS="$(CMAKELISTS)" $(BOOTLOADER_CI_BUILD_DIR)/bootloader.bin
+
+build_bootloader_emu: ## build the unix bootloader emulator
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" CMAKELISTS="$(CMAKELISTS)" $(BOOTLOADER_EMU_BUILD_DIR)/bootloader.elf
 
 build_prodtest: ## build production test firmware
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" $(PRODTEST_BUILD_DIR)/prodtest.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" \
+		CMAKELISTS="$(CMAKELISTS)" BOOTLOADER_DEVEL="$(BOOTLOADER_DEVEL)" $(PRODTEST_BUILD_DIR)/prodtest.bin
 
 build_reflash: ## build reflash firmware + reflash image
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" $(REFLASH_BUILD_DIR)/reflash.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" \
+		CMAKELISTS="$(CMAKELISTS)" $(REFLASH_BUILD_DIR)/reflash.bin
 	dd if=build/boardloader/boardloader.bin of=$(REFLASH_BUILD_DIR)/sdimage.bin bs=1 seek=0
 	dd if=build/bootloader/bootloader.bin of=$(REFLASH_BUILD_DIR)/sdimage.bin bs=1 seek=49152
 
 build_firmware: templates build_cross ## build firmware with frozen modules
-	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" TREZOR_MODEL="$(TREZOR_MODEL)" PYOPT="$(PYOPT)" BITCOIN_ONLY="$(BITCOIN_ONLY)" $(FIRMWARE_BUILD_DIR)/firmware.bin
+	$(SCONS) CFLAGS="$(CFLAGS)" PRODUCTION="$(PRODUCTION)" \
+		TREZOR_MODEL="$(TREZOR_MODEL)" CMAKELISTS="$(CMAKELISTS)" \
+		PYOPT="$(PYOPT)" BITCOIN_ONLY="$(BITCOIN_ONLY)" \
+		BOOTLOADER_QA="$(BOOTLOADER_QA)" BOOTLOADER_DEVEL="$(BOOTLOADER_DEVEL)" $(FIRMWARE_BUILD_DIR)/firmware.bin
 
 build_unix: templates ## build unix port
-	$(SCONS) CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) TREZOR_MODEL="$(TREZOR_MODEL)" BITCOIN_ONLY="$(BITCOIN_ONLY)"
+	$(SCONS) CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) \
+		TREZOR_MODEL="$(TREZOR_MODEL)" CMAKELISTS="$(CMAKELISTS)" \
+		PYOPT="0" BITCOIN_ONLY="$(BITCOIN_ONLY)" TREZOR_EMULATOR_ASAN="$(ADDRESS_SANITIZER)"
 
 build_unix_frozen: templates build_cross ## build unix port with frozen modules
-	$(SCONS) CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) TREZOR_MODEL="$(TREZOR_MODEL)" PYOPT="$(PYOPT)" BITCOIN_ONLY="$(BITCOIN_ONLY)" TREZOR_MEMPERF=$(TREZOR_MEMPERF) TREZOR_EMULATOR_FROZEN=1
+	$(SCONS) CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) \
+		TREZOR_MODEL="$(TREZOR_MODEL)" CMAKELISTS="$(CMAKELISTS)" \
+		PYOPT="$(PYOPT)" BITCOIN_ONLY="$(BITCOIN_ONLY)" TREZOR_EMULATOR_ASAN="$(ADDRESS_SANITIZER)" \
+		TREZOR_MEMPERF="$(TREZOR_MEMPERF)" TREZOR_EMULATOR_FROZEN=1
 
 build_unix_debug: templates ## build unix port
-	$(SCONS) --max-drift=1 CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) TREZOR_MODEL="$(TREZOR_MODEL)" TREZOR_EMULATOR_ASAN=1 TREZOR_EMULATOR_DEBUGGABLE=1
+	$(SCONS) --max-drift=1 CFLAGS="$(CFLAGS)" $(UNIX_BUILD_DIR)/trezor-emu-core $(UNIX_PORT_OPTS) \
+		TREZOR_MODEL="$(TREZOR_MODEL)" CMAKELISTS="$(CMAKELISTS)" \
+		BITCOIN_ONLY="$(BITCOIN_ONLY)" TREZOR_EMULATOR_ASAN=1 TREZOR_EMULATOR_DEBUGGABLE=1
 
 build_cross: ## build mpy-cross port
 	$(MAKE) -C vendor/micropython/mpy-cross $(CROSS_PORT_OPTS)
 
 ## clean commands:
 
-clean: clean_boardloader clean_bootloader clean_bootloader_ci clean_prodtest clean_reflash clean_firmware clean_unix clean_cross ## clean all
+clean: clean_boardloader clean_bootloader clean_bootloader_emu clean_bootloader_ci clean_prodtest clean_reflash clean_firmware clean_unix clean_cross ## clean all
 	rm -f ".sconsign.dblite"
 
 clean_boardloader: ## clean boardloader build
@@ -172,6 +235,9 @@ clean_bootloader: ## clean bootloader build
 
 clean_bootloader_ci: ## clean bootloader_ci build
 	rm -rf $(BOOTLOADER_CI_BUILD_DIR)
+
+clean_bootloader_emu: ## clean bootloader_emu build
+	rm -rf $(BOOTLOADER_EMU_BUILD_DIR)
 
 clean_prodtest: ## clean prodtest build
 	rm -rf $(PRODTEST_BUILD_DIR)
@@ -223,18 +289,18 @@ flash_erase_storage: ## erase storage sectors from flash
 	$(OPENOCD) -c "init; flash erase_sector 0 4 4; flash erase_sector 0 16 16; exit"
 
 flash_bootloader_jlink: $(BOOTLOADER_BUILD_DIR)/bootloader.bin ## flash bootloader using JLink
-	JLinkExe -nogui -commanderscript embed/bootloader/bootloader_flash.jlink
+	JLinkExe -nogui 1 -commanderscript embed/bootloader/bootloader_flash.jlink
 
 flash_bootloader_ci_jlink: $(BOOTLOADER_CI_BUILD_DIR)/bootloader.bin ## flash CI bootloader using JLink
-	JLinkExe -nogui -commanderscript embed/bootloader_ci/bootloader_flash.jlink
+	JLinkExe -nogui 1 -commanderscript embed/bootloader_ci/bootloader_flash.jlink
 
 flash_firmware_jlink: $(FIRMWARE_BUILD_DIR)/firmware.bin ## flash firmware using JLink. file names must end in .bin for JLink
 	cp -f $<.p1 $<.p1.bin
 	cp -f $<.p2 $<.p2.bin
-	JLinkExe -nogui -commanderscript embed/firmware/firmware_flash.jlink
+	JLinkExe -nogui 1 -commanderscript embed/firmware/firmware_flash.jlink
 
 flash_firmware_t1_jlink: $(FIRMWARE_BUILD_DIR)/firmware.bin ## flash T1 core port via JLink
-	JLinkExe -nogui -commanderscript embed/firmware/firmware_flash_t1.jlink
+	JLinkExe -nogui 1 -commanderscript embed/firmware/firmware_flash_t1.jlink
 
 ## openocd debug commands:
 
@@ -277,16 +343,20 @@ sizecheck: ## check sizes of binary files
 
 combine: ## combine boardloader + bootloader + prodtest into one combined image
 	./tools/combine_firmware \
-		$(BOARDLOADER_START) $(BOARDLOADER_BUILD_DIR)/boardloader.bin \
-		$(BOOTLOADER_START) $(BOOTLOADER_BUILD_DIR)/bootloader.bin \
-		$(PRODTEST_START) $(PRODTEST_BUILD_DIR)/prodtest.bin \
-		> $(PRODTEST_BUILD_DIR)/combined.bin
+		$(BOARDLOADER_BUILD_DIR)/boardloader.bin \
+		$(BOOTLOADER_BUILD_DIR)/bootloader.bin \
+		$(PRODTEST_BUILD_DIR)/prodtest.bin \
+		$(PRODTEST_BUILD_DIR)/combined.bin
 
 upload: ## upload firmware using trezorctl
-	trezorctl firmware_update -f $(FIRMWARE_BUILD_DIR)/firmware.bin
+	trezorctl firmware_update -s -f $(FIRMWARE_BUILD_DIR)/firmware.bin
 
 upload_prodtest: ## upload prodtest using trezorctl
-	trezorctl firmware_update -f $(PRODTEST_BUILD_DIR)/prodtest.bin
+	trezorctl firmware_update -s -f $(PRODTEST_BUILD_DIR)/prodtest.bin
 
-coverage:  # generate coverage report
+coverage:  ## generate coverage report
 	./tools/coverage-report
+
+unused:  ## find unused micropython code
+	vulture src src/_vulture_ignore.txt --exclude "messages.py,*/enums/*"
+

@@ -19,6 +19,7 @@ import time
 import pytest
 
 from trezorlib import device, messages
+from trezorlib.debuglink import TrezorClientDebugLink as Client
 from trezorlib.exceptions import TrezorFailure
 
 from ..common import TEST_ADDRESS_N, get_test_address
@@ -28,7 +29,7 @@ PIN4 = "1234"
 pytestmark = pytest.mark.setup_client(pin=PIN4)
 
 
-def pin_request(client):
+def pin_request(client: Client):
     return (
         messages.PinMatrixRequest
         if client.features.model == "1"
@@ -36,7 +37,7 @@ def pin_request(client):
     )
 
 
-def set_autolock_delay(client, delay):
+def set_autolock_delay(client: Client, delay):
     with client:
         client.use_pin_sequence([PIN4])
         client.set_expected_responses(
@@ -50,7 +51,7 @@ def set_autolock_delay(client, delay):
         device.apply_settings(client, auto_lock_delay_ms=delay)
 
 
-def test_apply_auto_lock_delay(client):
+def test_apply_auto_lock_delay(client: Client):
     set_autolock_delay(client, 10 * 1000)
 
     time.sleep(0.1)  # sleep less than auto-lock delay
@@ -77,12 +78,12 @@ def test_apply_auto_lock_delay(client):
         536870,  # 149 hours, maximum
     ],
 )
-def test_apply_auto_lock_delay_valid(client, seconds):
+def test_apply_auto_lock_delay_valid(client: Client, seconds):
     set_autolock_delay(client, seconds * 1000)
     assert client.features.auto_lock_delay_ms == seconds * 1000
 
 
-def test_autolock_default_value(client):
+def test_autolock_default_value(client: Client):
     assert client.features.auto_lock_delay_ms is None
     with client:
         client.use_pin_sequence([PIN4])
@@ -93,9 +94,9 @@ def test_autolock_default_value(client):
 
 @pytest.mark.parametrize(
     "seconds",
-    [0, 1, 9, 536871, 2 ** 22],
+    [0, 1, 9, 536871, 2**22],
 )
-def test_apply_auto_lock_delay_out_of_range(client, seconds):
+def test_apply_auto_lock_delay_out_of_range(client: Client, seconds):
     with client:
         client.use_pin_sequence([PIN4])
         client.set_expected_responses(
@@ -111,7 +112,7 @@ def test_apply_auto_lock_delay_out_of_range(client, seconds):
 
 
 @pytest.mark.skip_t1
-def test_autolock_cancels_ui(client):
+def test_autolock_cancels_ui(client: Client):
     set_autolock_delay(client, 10 * 1000)
 
     resp = client.call_raw(
@@ -132,3 +133,37 @@ def test_autolock_cancels_ui(client):
 
     assert isinstance(resp, messages.Failure)
     assert resp.code == messages.FailureType.ActionCancelled
+
+
+def test_autolock_ignores_initialize(client: Client):
+    set_autolock_delay(client, 10 * 1000)
+
+    assert client.features.unlocked is True
+
+    start = time.monotonic()
+    while time.monotonic() - start < 11:
+        # init_device should always work even if locked
+        client.init_device()
+        time.sleep(0.1)
+
+    # after 11 seconds we are definitely locked
+    assert client.features.unlocked is False
+
+
+def test_autolock_ignores_getaddress(client: Client):
+    set_autolock_delay(client, 10 * 1000)
+
+    assert client.features.unlocked is True
+
+    start = time.monotonic()
+    # let's continue for 8 seconds to give a little leeway to the slow CI
+    while time.monotonic() - start < 8:
+        get_test_address(client)
+        time.sleep(0.1)
+
+    # sleep 3 more seconds to wait for autolock
+    time.sleep(3)
+
+    # after 11 seconds we are definitely locked
+    client.refresh_features()
+    assert client.features.unlocked is False

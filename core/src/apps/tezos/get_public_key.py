@@ -1,21 +1,35 @@
-from trezor.messages.TezosPublicKey import TezosPublicKey
-from trezor.ui.layouts import show_pubkey
+from typing import TYPE_CHECKING
 
-from apps.common import paths, seed
 from apps.common.keychain import with_slip44_keychain
 
-from . import CURVE, PATTERNS, SLIP44_ID, helpers
+from . import CURVE, PATTERNS, SLIP44_ID
+
+if TYPE_CHECKING:
+    from trezor.messages import TezosGetPublicKey, TezosPublicKey
+
+    from apps.common.keychain import Keychain
 
 
 @with_slip44_keychain(*PATTERNS, slip44_id=SLIP44_ID, curve=CURVE)
-async def get_public_key(ctx, msg, keychain):
-    await paths.validate_path(ctx, keychain, msg.address_n)
+async def get_public_key(msg: TezosGetPublicKey, keychain: Keychain) -> TezosPublicKey:
+    from trezor.messages import TezosPublicKey
+    from trezor.ui.layouts import show_pubkey
+
+    from apps.common import paths, seed
+
+    from . import helpers
+
+    await paths.validate_path(keychain, msg.address_n)
 
     node = keychain.derive(msg.address_n)
     pk = seed.remove_ed25519_prefix(node.public_key())
-    pk_prefixed = helpers.base58_encode_check(pk, prefix=helpers.TEZOS_PUBLICKEY_PREFIX)
+    pk_prefixed = helpers.base58_encode_check(pk, helpers.TEZOS_PUBLICKEY_PREFIX)
 
     if msg.show_display:
-        await show_pubkey(ctx, pk_prefixed)
+        from . import PATTERNS, SLIP44_ID
+
+        account = paths.get_account_name("XTZ", msg.address_n, PATTERNS, SLIP44_ID)
+        path = paths.address_n_to_str(msg.address_n)
+        await show_pubkey(pk_prefixed, account=account, path=path)
 
     return TezosPublicKey(public_key=pk_prefixed)

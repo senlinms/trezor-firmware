@@ -3,25 +3,26 @@ All inputs set. Defining range signature parameters.
 If in the applicable offloading mode, generate commitment masks.
 """
 
-from apps.monero.layout import confirms
-from apps.monero.xmr import crypto
+from typing import TYPE_CHECKING
 
-from .state import State
+if TYPE_CHECKING:
+    from trezor.messages import MoneroTransactionAllInputsSetAck
 
-if False:
-    from trezor.messages.MoneroTransactionAllInputsSetAck import (
-        MoneroTransactionAllInputsSetAck,
-    )
+    from apps.monero.layout import MoneroTransactionProgress
+
+    from .state import State
 
 
-async def all_inputs_set(state: State) -> MoneroTransactionAllInputsSetAck:
+def all_inputs_set(
+    state: State, progress: MoneroTransactionProgress
+) -> MoneroTransactionAllInputsSetAck:
+    from trezor.messages import MoneroTransactionAllInputsSetAck
+
+    from apps.monero.xmr import crypto
+
     state.mem_trace(0)
 
-    await confirms.transaction_step(state, state.STEP_ALL_IN)
-
-    from trezor.messages.MoneroTransactionAllInputsSetAck import (
-        MoneroTransactionAllInputsSetAck,
-    )
+    progress.step(state, state.STEP_ALL_IN)
 
     if state.last_step != state.STEP_VINI:
         raise ValueError("Invalid state transition")
@@ -29,7 +30,7 @@ async def all_inputs_set(state: State) -> MoneroTransactionAllInputsSetAck:
         raise ValueError("Invalid input count")
 
     # The sum of the masks must match the input masks sum.
-    state.sumout = crypto.sc_init(0)
+    state.sumout = crypto.Scalar()
     state.last_step = state.STEP_ALL_IN
     resp = MoneroTransactionAllInputsSetAck()
     return resp
